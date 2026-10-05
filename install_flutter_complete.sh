@@ -460,7 +460,9 @@ mkdir -p "$WORK_DIR/apt_staging"
 
 # 預先下載並驗證所有套件（Staging Phase）
 echo "預先下載並驗證所有套件..."
-FLUTTER_DEB_URL="https://github.com/ImL1s/termux-flutter-wsl/releases/download/${RELEASE_TAG}/flutter_${FLUTTER_VERSION}_aarch64.deb"
+# URL del .deb parametrizable: permite usar el artifact de tu fork (gh run download)
+# sin depender del release antiguo. Ej: FLUTTER_DEB_URL=https://github.com/<TU>/<FORK>/releases/download/.../flutter_3.47.2_aarch64.deb
+FLUTTER_DEB_URL="${FLUTTER_DEB_URL:-https://github.com/ImL1s/termux-flutter-wsl/releases/download/${RELEASE_TAG}/flutter_${FLUTTER_VERSION}_aarch64.deb}"
 ANDROID_SDK_DEB_URL="https://github.com/mumumusuc/termux-android-sdk/releases/download/35.0.0/android-sdk_35.0.0_aarch64.deb"
 NDK_ARCHIVE_URL="https://github.com/lzhiyong/termux-ndk/releases/download/android-ndk/android-ndk-r29-aarch64.tar.xz"
 
