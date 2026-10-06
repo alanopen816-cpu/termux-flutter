@@ -317,6 +317,11 @@ resource:
     output: $prefix/share/flutter/post_install.sh
     mode: 0o755
 
+  configure_android:
+    source: $root/../scripts/install/configure_android.py
+    output: $prefix/share/flutter/configure_android.py
+    mode: 0o755
+
   check_toolchain:
     source: $root/../scripts/ci/check_toolchain.sh
     output: $prefix/share/flutter/check_toolchain.sh

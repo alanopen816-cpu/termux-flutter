@@ -2,9 +2,11 @@
 
 import os
 from pathlib import Path
+import sys
 
 from conftest import _installed_dartvm, isolated_user_env
 from test_offline_cache_repair import create_mock_env, run_post_install
+from test_android_configuration import native_aapt2
 
 
 def test_post_install_fixture_does_not_mutate_callers_flutter_settings(tmp_path, monkeypatch):
@@ -18,6 +20,26 @@ def test_post_install_fixture_does_not_mutate_callers_flutter_settings(tmp_path,
     monkeypatch.setenv("HOME", str(caller_home))
 
     flutter_root, android_sdk, prefix, _ = create_mock_env(tmp_path / "fixture")
+    # The post-install helper should run its real file validation and updates in
+    # this isolated fixture, while only the Android system identity is mocked.
+    native_aapt2(prefix / "bin" / "aapt2")
+    wrapper = prefix / "bin" / "python3"
+    helper_path = Path(__file__).parent.parent / "scripts/install/configure_android.py"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(Path(__file__).parent.parent)!r})\n"
+        "arguments = sys.argv[1:]\n"
+        f"if arguments and Path(arguments[0]).resolve() == Path({str(helper_path.resolve())!r}):\n"
+        "    from scripts.install import configure_android\n"
+        "    configure_android.is_termux_runtime = lambda _prefix: True\n"
+        "    sys.argv = arguments\n"
+        "    raise SystemExit(configure_android.main())\n"
+        "os.execv(sys.executable, [sys.executable, *arguments])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
     result = run_post_install(flutter_root, android_sdk, prefix, ["--apply"])
 
     assert result.returncode == 0, result.stdout + result.stderr

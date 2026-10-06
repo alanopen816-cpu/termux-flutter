@@ -1350,8 +1350,6 @@ if [ "$is_mode_b" = "true" ]; then
 
         # Reversible activation: Revert back to Mode A
         rm -rf "$BT_DIR/35.0.0" 2>/dev/null || true
-        sed -i '/android.aapt2FromMavenOverride/d' "$HOME/.gradle/gradle.properties" 2>/dev/null || true
-
         echo "  Mode B reverted. Please install a working NDK (e.g. lzhiyong/termux-ndk) to use Mode B."
         is_mode_b=false
     else
@@ -1427,20 +1425,9 @@ echo "  ✓ Android licenses accepted"
 
 # 10.5. Configure ANDROID_HOME in flutter config
 echo "[11.5/13] Setting Android SDK path in Flutter config..."
-mkdir -p "$HOME" 2>/dev/null || true
-if [ -f "$HOME/.flutter_settings" ]; then
-    grep -v '"android-sdk"' "$HOME/.flutter_settings" 2>/dev/null | grep -v '^[[:space:]]*}$' > "$HOME/.flutter_settings.tmp" 2>/dev/null || true
-    echo '  ,"android-sdk": "'"$ANDROID_SDK"'"' >> "$HOME/.flutter_settings.tmp"
-    echo '}' >> "$HOME/.flutter_settings.tmp"
-    mv "$HOME/.flutter_settings.tmp" "$HOME/.flutter_settings" 2>/dev/null || true
-else
-    cat > "$HOME/.flutter_settings" << SETTINGS
-{
-  "android-sdk": "$ANDROID_SDK",
-  "analytics": false
-}
-SETTINGS
-fi
+INSTALL_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+python3 "$INSTALL_SCRIPT_DIR/configure_android.py" \
+    --prefix "$PREFIX" --home "$HOME" --android-sdk "$ANDROID_SDK"
 echo "  ✓ ANDROID_HOME=$ANDROID_SDK"
 
 # 11. 複製 VM snapshots (for debug mode)

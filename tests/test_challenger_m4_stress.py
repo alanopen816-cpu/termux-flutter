@@ -607,5 +607,7 @@ def test_adv_mode_b_failure_auto_fallback_to_mode_a(tmp_path):
     # Verify Mode B failure message and fallback
     assert "Mode B toolchain validation failed" in res.stdout or "Reverting Mode B activation to Mode A" in res.stdout
 
-    # Verify gradle.properties Mode B override was stripped
-    assert "android.aapt2FromMavenOverride" not in gradle_props.read_text(encoding="utf-8")
+    # A failed Mode B probe must not erase a user-owned global Gradle setting.
+    assert gradle_props.read_text(encoding="utf-8") == (
+        "android.aapt2FromMavenOverride=/Android/Sdk/build-tools/35.0.0/aapt2\n"
+    )
