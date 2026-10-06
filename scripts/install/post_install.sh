@@ -1505,110 +1505,482 @@ fi
 
 # 13. Recompile flutter_tools.snapshot and stamp to guarantee offline flutter CLI execution
 finalize_flutter_tools_cache() {
-    echo "[13/13] Finalizing flutter_tools.snapshot and stamp..."
-    local FLUTTER_TOOLS_DIR="$FLUTTER_ROOT/packages/flutter_tools"
-    local SNAPSHOT_PATH="$FLUTTER_ROOT/bin/cache/flutter_tools.snapshot"
-    local STAMP_PATH="$FLUTTER_ROOT/bin/cache/flutter_tools.stamp"
-    local DART_BIN="$DART_SDK/bin/dart"
-    local ENTRY_POINT="$FLUTTER_TOOLS_DIR/bin/flutter_tools.dart"
-    local PKG_CONFIG="$FLUTTER_TOOLS_DIR/.dart_tool/package_config.json"
-    local PUBSPEC_LOCK="$FLUTTER_TOOLS_DIR/pubspec.lock"
-    local PUBSPEC_YAML="$FLUTTER_TOOLS_DIR/pubspec.yaml"
+    echo "[13/13] Finalizing FlutterTools snapshot and stamp transactionally..."
+    python3 - "$FLUTTER_ROOT" "$DART_SDK/bin/dart" "${FLUTTER_TOOL_ARGS:-}" "${TMPDIR:-$PREFIX/tmp}" <<'PY'
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+import errno
+import hashlib
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urljoin, urlsplit
 
-    # Remove any existing snapshot and stamp before generating
-    rm -f "$SNAPSHOT_PATH" "$STAMP_PATH"
 
-    if [ ! -f "$DART_BIN" ] && [ ! -x "$DART_BIN" ]; then
-        echo "  ❌ Error: Dart compiler missing at $DART_BIN" >&2
-        return 1
-    fi
-    if [ ! -f "$ENTRY_POINT" ]; then
-        echo "  ❌ Error: flutter_tools entry point missing at $ENTRY_POINT" >&2
-        return 1
-    fi
+class FinalizerError(Exception):
+    pass
 
-    local REVISION=""
-    if [ -f "$FLUTTER_ROOT/bin/internal/engine.version" ]; then
-        REVISION=$(cat "$FLUTTER_ROOT/bin/internal/engine.version" 2>/dev/null | tr -d '\n\r')
-    elif [ -n "${FLUTTER_PREBUILT_ENGINE_VERSION:-}" ]; then
-        REVISION="$FLUTTER_PREBUILT_ENGINE_VERSION"
-    fi
-    if [ -z "$REVISION" ]; then
-        if [ -x "$PREFIX/bin/git" ] && [ -d "$FLUTTER_ROOT/.git" ]; then
-            REVISION=$("$PREFIX/bin/git" -C "$FLUTTER_ROOT" rev-parse HEAD 2>/dev/null || true)
-        elif command -v git >/dev/null 2>&1 && [ -d "$FLUTTER_ROOT/.git" ]; then
-            REVISION=$(git -C "$FLUTTER_ROOT" rev-parse HEAD 2>/dev/null || true)
-        fi
-    fi
-    if [ -z "$REVISION" ]; then
-        echo "  ❌ Error: Failed to determine Flutter SDK revision" >&2
-        return 1
-    fi
 
-    # The stamp must carry the exact key flutter's launcher compares against, or the
-    # launcher throws away the snapshot built here and recompiles on the first
-    # `flutter` run. bin/internal/shared.sh (upgrade_flutter) computes:
-    #   compilekey="$revision:$FLUTTER_TOOL_ARGS" with
-    #   revision="$(git -C "$FLUTTER_ROOT" rev-parse HEAD)"
-    local TOOL_ARGS="${FLUTTER_TOOL_ARGS:-}"
-    local GIT_BIN=""
-    if [ -x "$PREFIX/bin/git" ]; then
-        GIT_BIN="$PREFIX/bin/git"
-    elif command -v git >/dev/null 2>&1; then
-        GIT_BIN="$(command -v git)"
-    fi
-    local CHECKOUT_REV=""
-    if [ -n "$GIT_BIN" ] && [ -d "$FLUTTER_ROOT/.git" ]; then
-        CHECKOUT_REV=$("$GIT_BIN" -C "$FLUTTER_ROOT" rev-parse HEAD 2>/dev/null || true)
-    fi
-    local COMPILE_KEY="${CHECKOUT_REV:-$REVISION}:$TOOL_ARGS"
+class Interrupted(FinalizerError):
+    def __init__(self, signum):
+        self.signum = int(signum)
+        super().__init__(f"Interrupted by signal {self.signum}")
 
-    # Ensure pubspec.lock exists and is strictly newer than pubspec.yaml
-    if [ -f "$PUBSPEC_YAML" ]; then
-        touch -t 202701010000 "$PUBSPEC_LOCK" 2>/dev/null || touch "$PUBSPEC_LOCK"
-    fi
 
-    # Ensure bin/cache directory exists
-    mkdir -p "$FLUTTER_ROOT/bin/cache"
+def fsync_file(path):
+    with open(path, "rb") as stream:
+        os.fsync(stream.fileno())
 
-    # Ensure environment variables are active during snapshot generation
-    export PATH="$PREFIX/bin:$PATH"
-    export TMPDIR
-    if [ -n "$REVISION" ]; then
-        export FLUTTER_PREBUILT_ENGINE_VERSION="$REVISION"
-    fi
 
-    # Compile snapshot with --snapshot-kind="app-jit" and --no-enable-mirrors matching shared.sh
-    # Note: passing "--version" as argument allows flutter_tools.dart to execute and produce complete App-JIT snapshot
-    local COMPILE_OK=0
-    if [ -f "$PKG_CONFIG" ]; then
-        if "$DART_BIN" --verbosity=error --snapshot="$SNAPSHOT_PATH" --snapshot-kind="app-jit" --packages="$PKG_CONFIG" --no-enable-mirrors "$ENTRY_POINT" "--version" >/dev/null 2>&1; then
-            COMPILE_OK=1
-        fi
-    fi
-    if [ "$COMPILE_OK" -ne 1 ]; then
-        if "$DART_BIN" --verbosity=error --snapshot="$SNAPSHOT_PATH" --snapshot-kind="app-jit" --no-enable-mirrors "$ENTRY_POINT" "--version" >/dev/null 2>&1; then
-            COMPILE_OK=1
-        fi
-    fi
+def fsync_dir(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+    finally:
+        os.close(descriptor)
 
-    if [ "$COMPILE_OK" -ne 1 ] || [ ! -s "$SNAPSHOT_PATH" ]; then
-        echo "  ❌ Error: Failed to compile flutter_tools.snapshot" >&2
-        "$DART_BIN" --verbosity=error --snapshot="$SNAPSHOT_PATH" --snapshot-kind="app-jit" --packages="$PKG_CONFIG" --no-enable-mirrors "$ENTRY_POINT" "--version" || true
-        rm -f "$SNAPSHOT_PATH" "$STAMP_PATH"
-        return 1
-    fi
 
-    # Write stamp ONLY after snapshot compilation and size verification succeeds
-    echo -n "$COMPILE_KEY" > "$STAMP_PATH"
-    if [ ! -s "$STAMP_PATH" ] || [ "$(< "$STAMP_PATH")" != "$COMPILE_KEY" ]; then
-        echo "  ❌ Error: Failed to write valid flutter_tools.stamp" >&2
-        rm -f "$SNAPSHOT_PATH" "$STAMP_PATH"
-        return 1
-    fi
+def checked_run(command, env, description):
+    process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    try:
+        _, stderr = process.communicate()
+    except BaseException:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise
+    if process.returncode:
+        raise FinalizerError(f"{description} failed (exit {process.returncode}): {stderr.strip()}")
 
-    echo "  ✓ flutter_tools.snapshot and flutter_tools.stamp finalized (key=$COMPILE_KEY)"
-    return 0
+
+def resolve_packages(config, root):
+    try:
+        data = json.loads(config.read_text())
+    except (OSError, ValueError) as error:
+        raise FinalizerError(f"Cannot read FlutterTools package config: {error}")
+    if not isinstance(data, dict) or data.get("configVersion") != 2 or not isinstance(data.get("packages"), list):
+        raise FinalizerError("FlutterTools package_config.json is invalid; refusing a package-less compile")
+    roots = []
+    for package in data["packages"]:
+        uri = package.get("rootUri") if isinstance(package, dict) else None
+        if not isinstance(uri, str):
+            raise FinalizerError("FlutterTools package config contains an invalid package root")
+        resolved_uri = urljoin(config.as_uri(), uri)
+        parsed = urlsplit(resolved_uri)
+        if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+            raise FinalizerError(f"Unsupported FlutterTools package root URI: {uri}")
+        try:
+            package_root = Path(unquote(parsed.path)).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise FinalizerError(f"FlutterTools package root is missing or unsafe ({uri}): {error}")
+        if not package_root.is_dir():
+            raise FinalizerError(f"FlutterTools package root is missing or not a directory: {package_root}")
+        roots.append((package, package_root))
+    return data, roots
+
+
+def isolated_tool_copy(root, config, packages, temp_root):
+    isolated = temp_root / "sdk"
+    isolated.mkdir(parents=True)
+    (isolated / "bin" / "internal").mkdir(parents=True)
+    (isolated / "bin" / "cache").mkdir(parents=True)
+    try:
+        # Dereference links into scratch copies so compiler inputs cannot reach live writable SDK paths.
+        shutil.copytree(root / "packages", isolated / "packages", symlinks=False)
+    except (OSError, shutil.Error, RuntimeError) as error:
+        raise FinalizerError(f"Cannot safely copy FlutterTools source tree into isolation: {error}")
+    tools = root / "packages" / "flutter_tools"
+    for name in ("pubspec.yaml", "pubspec.lock"):
+        if (tools / name).is_file():
+            shutil.copy2(tools / name, isolated / "packages" / "flutter_tools" / name)
+    for name in ("engine.version",):
+        if (root / "bin" / "internal" / name).is_file():
+            shutil.copy2(root / "bin" / "internal" / name, isolated / "bin" / "internal" / name)
+    if (root / "version").is_file():
+        shutil.copy2(root / "version", isolated / "version")
+    for name in ("flutter.version.json", "engine.stamp", "engine.realm", "engine-dart-sdk.stamp",
+                 "engine_stamp.json", "engine_stamp.stamp"):
+        source = root / "bin" / "cache" / name
+        if source.is_file():
+            shutil.copy2(source, isolated / "bin" / "cache" / name)
+    (isolated / "packages" / "flutter_tools" / ".dart_tool").mkdir(exist_ok=True)
+    remapped = json.loads(json.dumps(packages))
+    root_resolved = root.resolve()
+    for index, (_, package_root) in enumerate(resolve_packages(config, root)[1]):
+        try:
+            relative = package_root.relative_to(root_resolved)
+        except ValueError:
+            relative = None
+        if relative is not None:
+            copied_root = isolated / relative
+            if not copied_root.is_dir():
+                raise FinalizerError(f"Package root was not copied into the isolated SDK: {package_root}")
+        else:
+            copied_root = isolated / ".packages" / str(index)
+            copied_root.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copytree(package_root, copied_root, symlinks=False)
+            except (OSError, shutil.Error, RuntimeError) as error:
+                raise FinalizerError(f"Cannot safely copy external FlutterTools package root {package_root}: {error}")
+        remapped["packages"][index]["rootUri"] = copied_root.as_uri() + "/"
+    isolated_config = isolated / "packages" / "flutter_tools" / ".dart_tool" / "package_config.json"
+    isolated_config.write_text(json.dumps(remapped) + "\n")
+    shutil.copy2(config.parent.parent / "pubspec.yaml", isolated / "packages" / "flutter_tools" / "pubspec.yaml")
+    shutil.copy2(config.parent.parent / "pubspec.lock", isolated / "packages" / "flutter_tools" / "pubspec.lock")
+    fsync_file(isolated_config)
+    return isolated, isolated_config
+
+
+def recognized_absent_baseline_link(path, current, generations):
+    expected = {
+        "flutter_tools.snapshot": ".flutter_tools_current/flutter_tools.snapshot",
+        "flutter_tools.stamp": ".flutter_tools_current/flutter_tools.stamp",
+    }.get(path.name)
+    if not expected or not path.is_symlink() or os.readlink(path) != expected or not current.is_symlink():
+        return False
+    try:
+        baseline = current.resolve(strict=True)
+        baseline.relative_to(generations.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+    marker = baseline / ".flutter_tools_baseline"
+    return (baseline.parent == generations.resolve() and baseline.name.startswith("baseline-")
+            and marker.is_file() and marker.read_bytes() == b"flutter-tools-baseline-v1\n"
+            and not (baseline / path.name).exists())
+
+
+def visible_file(path, current, generations):
+    if path.is_symlink() and not path.exists():
+        if recognized_absent_baseline_link(path, current, generations):
+            return None
+        raise FinalizerError(f"Refusing to replace unrecognized broken FlutterTools cache symlink: {path}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise FinalizerError(f"Refusing to replace non-file FlutterTools cache path: {path}")
+    if path.is_symlink() and ".flutter_tools_current" not in os.readlink(path):
+        raise FinalizerError(f"Refusing to replace unrecognized FlutterTools cache symlink: {path}")
+    return path
+
+
+def copy_metadata(source, destination):
+    if source is None:
+        os.chmod(destination, 0o644)
+        return
+    info = source.stat()
+    os.chown(destination, info.st_uid, info.st_gid)
+    os.chmod(destination, info.st_mode & 0o7777)
+    os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns))
+
+
+def read_key(stamp):
+    try:
+        return stamp.read_text().rstrip("\n")
+    except OSError:
+        return None
+
+
+def hash_input_path(digest, label, path, ancestors=()):
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+    except (OSError, RuntimeError) as error:
+        raise FinalizerError(f"Cannot fingerprint FlutterTools input {path}: {error}")
+    kind = "directory" if resolved.is_dir() else "file" if resolved.is_file() else "other"
+    digest.update(label.encode() + b"\0" + kind.encode() + b"\0")
+    digest.update(str(info.st_mode & 0o7777).encode() + b"\0")
+    if kind == "directory":
+        identity = (info.st_dev, info.st_ino)
+        if identity in ancestors:
+            raise FinalizerError(f"FlutterTools source symlink cycle while fingerprinting: {path}")
+        try:
+            children = sorted(resolved.iterdir(), key=lambda child: child.name)
+        except OSError as error:
+            raise FinalizerError(f"Cannot read FlutterTools source directory {resolved}: {error}")
+        for child in children:
+            hash_input_path(digest, f"{label}/{child.name}", child, (*ancestors, identity))
+    elif kind == "file":
+        try:
+            with resolved.open("rb") as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError as error:
+            raise FinalizerError(f"Cannot read FlutterTools source file {resolved}: {error}")
+    else:
+        raise FinalizerError(f"Unsupported FlutterTools source input type: {resolved}")
+    digest.update(b"\0")
+
+
+def inputs_fingerprint(root, dart, config, tool_args):
+    digest = hashlib.sha256()
+    digest.update(b"flutter-tools-inputs-v1\0")
+    digest.update("\0".join(tool_args).encode())
+    package_data, packages = resolve_packages(config, root)
+    hash_input_path(digest, "flutter_tools_source", root / "packages" / "flutter_tools")
+    hash_input_path(digest, "package_config", config)
+    hash_input_path(digest, "engine_version_stamp", root / "bin" / "cache" / "engine.stamp")
+    hash_input_path(digest, "engine_stamp_metadata", root / "bin" / "cache" / "engine_stamp.json")
+    hash_input_path(digest, "engine_stamp_cache_marker", root / "bin" / "cache" / "engine_stamp.stamp")
+    seen = {str((root / "packages" / "flutter_tools").resolve())}
+    for index, (_, package_root) in enumerate(packages):
+        canonical = str(package_root.resolve())
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        hash_input_path(digest, f"package_root_{index}", package_root)
+    hash_input_path(digest, "dart_compiler", dart)
+    dartvm = dart.with_name("dartvm")
+    if dartvm.is_file():
+        hash_input_path(digest, "dart_vm", dartvm)
+    return digest.hexdigest()
+
+
+def validate_engine_stamp(path, engine_version_path, cache_stamp_path):
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        raise FinalizerError(f"Flutter engine_stamp.json is missing or invalid; isolated version validation cannot safely run: {error}")
+    if (not isinstance(data, dict) or type(data.get("build_time_ms")) is not int
+            or not isinstance(data.get("git_revision"), str) or not data["git_revision"]
+            or not isinstance(data.get("content_hash"), str) or not data["content_hash"]
+            or not isinstance(data.get("git_revision_date"), str)):
+        raise FinalizerError(f"Flutter engine_stamp.json is missing required fields: {path}")
+    try:
+        datetime.fromisoformat(data["git_revision_date"].replace("Z", "+00:00"))
+    except ValueError as error:
+        raise FinalizerError(f"Flutter engine_stamp.json has an invalid git_revision_date: {error}")
+    try:
+        engine_revision = engine_version_path.read_text().strip()
+        cache_revision = cache_stamp_path.read_text().strip()
+    except OSError as error:
+        raise FinalizerError(f"Flutter engine_stamp cache markers are missing or unreadable: {error}")
+    if not engine_revision or cache_revision != engine_revision:
+        raise FinalizerError("Flutter engine_stamp cache marker does not match engine.stamp; refusing a possible HTTP fallback")
+    if data["git_revision"] != engine_revision:
+        raise FinalizerError("Flutter engine_stamp.json git_revision does not match engine.stamp")
+
+
+def pair_valid(snapshot, stamp, key, yaml, lock, current, generations, fingerprint):
+    if not (snapshot.is_file() and snapshot.stat().st_size > 0 and read_key(stamp) == key
+            and yaml.is_file() and lock.is_file() and yaml.stat().st_mtime_ns <= lock.stat().st_mtime_ns
+            and managed_layout(snapshot, stamp, current, generations)):
+        return False
+    manifest = current / "flutter_tools.inputs.sha256"
+    return manifest.is_file() and manifest.read_text().strip() == f"v1:{fingerprint}"
+
+
+def managed_layout(snapshot, stamp, current, generations):
+    if not (snapshot.is_symlink() and stamp.is_symlink() and current.is_symlink()):
+        return False
+    if (os.readlink(snapshot) != ".flutter_tools_current/flutter_tools.snapshot"
+            or os.readlink(stamp) != ".flutter_tools_current/flutter_tools.stamp"):
+        return False
+    try:
+        current.resolve(strict=True).relative_to(generations.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def atomic_symlink(target, link):
+    temporary = link.with_name(link.name + ".new-" + uuid.uuid4().hex)
+    os.symlink(target, temporary)
+    try:
+        os.replace(temporary, link)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    fsync_dir(link.parent)
+
+
+def baseline_visible_pair(snapshot, stamp, current, generations, cache):
+    baseline_stage = Path(tempfile.mkdtemp(prefix=".baseline-", dir=generations))
+    visible = (visible_file(snapshot, current, generations), visible_file(stamp, current, generations))
+    for source, name in zip(visible, ("flutter_tools.snapshot", "flutter_tools.stamp")):
+        if source is not None:
+            destination = baseline_stage / name
+            shutil.copy2(source, destination)
+            info = source.stat()
+            os.chown(destination, info.st_uid, info.st_gid)
+            os.chmod(destination, info.st_mode & 0o7777)
+            os.utime(destination, ns=(info.st_atime_ns, info.st_mtime_ns))
+            fsync_file(destination)
+    marker = baseline_stage / ".flutter_tools_baseline"
+    marker.write_bytes(b"flutter-tools-baseline-v1\n")
+    fsync_file(marker)
+    fsync_dir(baseline_stage)
+    baseline = generations / ("baseline-" + uuid.uuid4().hex)
+    os.replace(baseline_stage, baseline)
+    fsync_dir(generations)
+    atomic_symlink(os.path.relpath(baseline, cache), current)
+    atomic_symlink(".flutter_tools_current/flutter_tools.snapshot", snapshot)
+    atomic_symlink(".flutter_tools_current/flutter_tools.stamp", stamp)
+
+
+def main():
+    root = Path(sys.argv[1]).resolve()
+    dart = Path(sys.argv[2])
+    # shared.sh expands $FLUTTER_TOOL_ARGS unquoted, so its arguments use IFS word splitting.
+    tool_args = sys.argv[3].split()
+    temp_root = Path(sys.argv[4]).resolve()
+    temp_root.mkdir(parents=True, exist_ok=True)
+    cache = root / "bin" / "cache"
+    tools = root / "packages" / "flutter_tools"
+    snapshot = cache / "flutter_tools.snapshot"
+    stamp = cache / "flutter_tools.stamp"
+    config = tools / ".dart_tool" / "package_config.json"
+    engine_stamp = cache / "engine_stamp.json"
+    engine_version_stamp = cache / "engine.stamp"
+    engine_stamp_cache_marker = cache / "engine_stamp.stamp"
+    entry = tools / "bin" / "flutter_tools.dart"
+    yaml = tools / "pubspec.yaml"
+    lock = tools / "pubspec.lock"
+    shared = root / "bin" / "internal" / "shared.sh"
+    if fcntl is None:
+        raise FinalizerError("Python fcntl.flock is unavailable; cannot safely coordinate with Flutter startup")
+    validate_engine_stamp(engine_stamp, engine_version_stamp, engine_stamp_cache_marker)
+    if not dart.is_file() or not os.access(dart, os.X_OK):
+        raise FinalizerError(f"Dart compiler missing or not executable at {dart}")
+    for required in (entry, config, yaml, lock, shared):
+        if not required.is_file():
+            raise FinalizerError(f"Required FlutterTools finalizer input is missing: {required}")
+    if yaml.stat().st_mtime_ns > lock.stat().st_mtime_ns:
+        raise FinalizerError("FlutterTools pubspec.lock is stale; resolve FlutterTools packages before finalization")
+    package_data, _ = resolve_packages(config, root)
+    revision = ""
+    if (root / ".git").exists():
+        git = shutil.which("git")
+        if git:
+            result = subprocess.run([git, "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True)
+            if result.returncode == 0:
+                revision = result.stdout.strip()
+    if not revision:
+        revision = os.environ.get("FLUTTER_PREBUILT_ENGINE_VERSION", "")
+    if not revision and (root / "bin" / "internal" / "engine.version").is_file():
+        revision = (root / "bin" / "internal" / "engine.version").read_text().strip()
+    if not revision:
+        raise FinalizerError("Failed to determine Flutter SDK revision")
+    key = f"{revision}:{sys.argv[3]}"
+    # Match the launcher lock: exclusive flock on shared.sh itself (its fd 7).
+    with shared.open("rb") as lock_stream:
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise FinalizerError("Timed out waiting for Flutter shared.sh startup lock")
+                time.sleep(0.1)
+
+        current = cache / ".flutter_tools_current"
+        generations = cache / ".flutter_tools_generations"
+        generations.mkdir(parents=True, exist_ok=True)
+        package_data, _ = resolve_packages(config, root)
+        fingerprint = inputs_fingerprint(root, dart, config, tool_args)
+        if pair_valid(snapshot, stamp, key, yaml, lock, current, generations, fingerprint):
+            print(f"  ✓ Existing FlutterTools generation is current (key={key}, inputs={fingerprint})")
+            return 0
+
+        interrupted = []
+        def on_signal(signum, _frame):
+            interrupted.append(signum)
+            raise Interrupted(signum)
+        previous_signals = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
+        stage = Path(tempfile.mkdtemp(prefix=".stage-", dir=generations))
+        isolated_temp = Path(tempfile.mkdtemp(prefix="flutter-tools-check-", dir=temp_root))
+        try:
+            isolated_root, isolated_config = isolated_tool_copy(root, config, package_data, isolated_temp)
+            isolated_entry = isolated_root / "packages" / "flutter_tools" / "bin" / "flutter_tools.dart"
+            stage_snapshot = stage / "flutter_tools.snapshot"
+            stage_stamp = stage / "flutter_tools.stamp"
+            stage_manifest = stage / "flutter_tools.inputs.sha256"
+            env = dict(os.environ)
+            env.update({"FLUTTER_ROOT": str(isolated_root), "HOME": str(isolated_temp / "home"),
+                        "PUB_CACHE": str(isolated_root / ".pub-cache"), "TMPDIR": str(isolated_temp / "tmp")})
+            Path(env["HOME"]).mkdir(parents=True)
+            Path(env["TMPDIR"]).mkdir()
+            Path(env["PUB_CACHE"]).mkdir(exist_ok=True)
+            compile_args = [str(dart), "--verbosity=error", *tool_args,
+                            f"--snapshot={stage_snapshot}", "--snapshot-kind=kernel",
+                            f"--packages={isolated_config}", "--no-enable-mirrors", str(isolated_entry), "--version"]
+            checked_run(compile_args, env, "Failed to compile flutter_tools.snapshot")
+            if interrupted:
+                raise Interrupted(interrupted[-1])
+            if not stage_snapshot.is_file() or stage_snapshot.stat().st_size == 0:
+                raise FinalizerError("Dart returned success but produced an empty FlutterTools snapshot")
+            stage_stamp.write_bytes(key.encode())
+            if not stage_stamp.is_file() or not stage_stamp.stat().st_size or read_key(stage_stamp) != key:
+                raise FinalizerError("Failed to write a valid staged flutter_tools.stamp")
+            copy_metadata(visible_file(snapshot, cache / ".flutter_tools_current", cache / ".flutter_tools_generations"), stage_snapshot)
+            copy_metadata(visible_file(stamp, cache / ".flutter_tools_current", cache / ".flutter_tools_generations"), stage_stamp)
+            stage_manifest.write_text(f"v1:{fingerprint}\n")
+            if stage_manifest.read_text().strip() != f"v1:{fingerprint}":
+                raise FinalizerError("Failed to write a valid FlutterTools input manifest")
+            fsync_file(stage_snapshot)
+            fsync_file(stage_stamp)
+            fsync_file(stage_manifest)
+            fsync_dir(stage)
+            # Load the candidate from the complete isolated tool tree; never run it against the live SDK.
+            load_env = dict(env)
+            load_env["FLUTTER_ROOT"] = str(isolated_root)
+            checked_run([str(dart), f"--packages={isolated_config}", *tool_args,
+                         str(stage_snapshot), "--no-version-check", "--suppress-analytics", "--version"],
+                        load_env, "Isolated FlutterTools snapshot validation")
+            if interrupted:
+                raise Interrupted(interrupted[-1])
+            if inputs_fingerprint(root, dart, config, tool_args) != fingerprint:
+                raise FinalizerError("FlutterTools compiler inputs changed during staging; refusing publication")
+
+            generation = generations / ("generation-" + uuid.uuid4().hex)
+            os.replace(stage, generation)
+            fsync_dir(generations)
+            # First-time conversion/recovery: materialize the visible old pair with metadata preserved.
+            managed = managed_layout(snapshot, stamp, current, generations)
+            if not managed:
+                baseline_visible_pair(snapshot, stamp, current, generations, cache)
+            if inputs_fingerprint(root, dart, config, tool_args) != fingerprint:
+                raise FinalizerError("FlutterTools compiler inputs changed before publication; refusing pointer switch")
+            atomic_symlink(os.path.relpath(generation, cache), current)
+            print(f"  ✓ FlutterTools generation published (key={key})")
+            return 0
+        finally:
+            for sig, handler in previous_signals.items():
+                signal.signal(sig, handler)
+            shutil.rmtree(isolated_temp, ignore_errors=True)
+            if stage.exists():
+                shutil.rmtree(stage, ignore_errors=True)
+
+
+try:
+    sys.exit(main())
+except Interrupted as error:
+    print(f"  ❌ Error: {error}; the published FlutterTools generation remains intact", file=sys.stderr)
+    sys.exit(128 + error.signum)
+except (FinalizerError, OSError, ValueError, KeyError) as error:
+    print(f"  ❌ Error: {error}", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 ensure_profile_env() {

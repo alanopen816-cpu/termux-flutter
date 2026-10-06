@@ -71,9 +71,19 @@ def create_mock_env(tmp_path):
 
     pkg_cfg = flutter_root / "packages" / "flutter_tools" / ".dart_tool" / "package_config.json"
     pkg_cfg.parent.mkdir(parents=True, exist_ok=True)
-    pkg_cfg.write_text("{}", newline="\n")
+    pkg_cfg.write_text('{"configVersion": 2, "packages": []}', newline="\n")
+    tools_dir = flutter_root / "packages" / "flutter_tools"
+    (tools_dir / "pubspec.yaml").write_text("name: flutter_tools\n", newline="\n")
+    (tools_dir / "pubspec.lock").write_text("# lockfile\n", newline="\n")
 
     (flutter_root / "bin" / "internal" / "engine.version").write_text("dummy_version", newline="\n")
+    (flutter_root / "bin" / "cache" / "engine_stamp.json").write_text(
+        '{"build_time_ms": 1770000000000, "git_revision": "dummy_version", '
+        '"git_revision_date": "2026-06-09T00:00:00Z", "content_hash": "dummy_version"}\n',
+        newline="\n",
+    )
+    (flutter_root / "bin" / "cache" / "engine.stamp").write_text("dummy_version\n", newline="\n")
+    (flutter_root / "bin" / "cache" / "engine_stamp.stamp").write_text("dummy_version\n", newline="\n")
     (flutter_root / "version").write_text("3.44.0", newline="\n")
 
     # Target files with upstream preimages

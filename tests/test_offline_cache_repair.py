@@ -62,7 +62,7 @@ def create_mock_env(tmp_path):
     # Package config
     pkg_cfg = flutter_root / "packages" / "flutter_tools" / ".dart_tool" / "package_config.json"
     pkg_cfg.parent.mkdir(parents=True, exist_ok=True)
-    pkg_cfg.write_text("{}", newline="\n")
+    pkg_cfg.write_text('{"configVersion": 2, "packages": []}', newline="\n")
 
     # Pubspec yaml and lock
     pubspec_yaml = flutter_root / "packages" / "flutter_tools" / "pubspec.yaml"
@@ -71,6 +71,15 @@ def create_mock_env(tmp_path):
     pubspec_lock.write_text("# lockfile\n", newline="\n")
 
     (flutter_root / "bin" / "internal" / "engine.version").write_text("77e2e94772b6eb43759e34ed1ad7da4674e19cab", newline="\n")
+    (flutter_root / "bin" / "cache" / "engine_stamp.json").write_text(
+        '{"build_time_ms": 1770000000000, "git_revision": "77e2e94772b6eb43759e34ed1ad7da4674e19cab", '
+        '"git_revision_date": "2026-06-09T00:00:00Z", '
+        '"content_hash": "77e2e94772b6eb43759e34ed1ad7da4674e19cab"}\n',
+        newline="\n",
+    )
+    engine_revision = "77e2e94772b6eb43759e34ed1ad7da4674e19cab"
+    (flutter_root / "bin" / "cache" / "engine.stamp").write_text(engine_revision + "\n", newline="\n")
+    (flutter_root / "bin" / "cache" / "engine_stamp.stamp").write_text(engine_revision + "\n", newline="\n")
     (flutter_root / "version").write_text("3.44.0", newline="\n")
 
     # Preimage files for post_install.sh patches
