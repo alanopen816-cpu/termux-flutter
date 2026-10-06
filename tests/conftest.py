@@ -2,14 +2,90 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Union
+import pytest
 
 # Ensure repository root and tests directory are in sys.path
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parent
+
+
+def _installed_dartvm(environment=None) -> str | None:
+    """Resolve DartVM before pytest replaces HOME and other user directories."""
+    environment = os.environ if environment is None else environment
+    configured = environment.get("DARTVM")
+    if configured:
+        return str(Path(configured).expanduser().resolve())
+    discovered = shutil.which("dartvm", path=environment.get("PATH"))
+    if discovered:
+        return str(Path(discovered).resolve())
+    prefix = environment.get("PREFIX", "/data/data/com.termux/files/usr")
+    installed = Path(prefix) / "opt/flutter/bin/cache/dart-sdk/bin/dartvm"
+    return str(installed.resolve()) if installed.is_file() else None
+
+
+_DARTVM = _installed_dartvm()
+
+
+def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, str]:
+    """Return a subprocess environment whose persistent user state is test-local."""
+    root = Path(state_root).resolve()
+    home = root / "home"
+    paths = {
+        "HOME": home,
+        "XDG_CONFIG_HOME": home / ".config",
+        "XDG_CACHE_HOME": home / ".cache",
+        "XDG_DATA_HOME": home / ".local/share",
+        "XDG_STATE_HOME": home / ".local/state",
+        "XDG_RUNTIME_DIR": home / ".runtime",
+        "GRADLE_USER_HOME": home / ".gradle",
+        "PUB_CACHE": home / ".pub-cache",
+        "ANDROID_USER_HOME": home / ".android",
+        "ANDROID_SDK_HOME": home / ".android-sdk-home",
+        "ANDROID_AVD_HOME": home / ".android/avd",
+        "TMPDIR": root / "tmp",
+        "TMP": root / "tmp",
+        "TEMP": root / "tmp",
+    }
+    for path in paths.values():
+        path.mkdir(parents=True, exist_ok=True)
+    paths["XDG_RUNTIME_DIR"].chmod(0o700)
+    env = os.environ.copy() if base_env is None else dict(base_env)
+    env.update({key: str(value) for key, value in paths.items()})
+    if env.get("DARTVM"):
+        env["DARTVM"] = str(Path(env["DARTVM"]).expanduser().resolve())
+    elif _DARTVM:
+        env["DARTVM"] = _DARTVM
+    return env
+
+
+@pytest.fixture(autouse=True)
+def isolate_test_user_state(tmp_path, monkeypatch):
+    """Prevent tests and child processes from writing persistent HOME/XDG caches."""
+    env = isolated_user_env(tmp_path / ".pytest-user-state")
+    for key in (
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "GRADLE_USER_HOME",
+        "PUB_CACHE",
+        "ANDROID_USER_HOME",
+        "ANDROID_SDK_HOME",
+        "ANDROID_AVD_HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "DARTVM",
+    ):
+        if key in env:
+            monkeypatch.setenv(key, env[key])
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

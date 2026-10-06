@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).parent.parent
 POST_INSTALL = REPO_ROOT / "scripts" / "install" / "post_install.sh"
 
 
-from conftest import CHROME_CANDIDATES_MARKER, CHROME_FIXTURE, CHROME_LEGACY_PREIMAGE, to_bash_path
+from conftest import CHROME_CANDIDATES_MARKER, CHROME_FIXTURE, CHROME_LEGACY_PREIMAGE, isolated_user_env, to_bash_path
 
 
 def canonical_provenance():
@@ -166,7 +166,8 @@ def run_post_install(flutter_root, android_sdk, prefix, args=None):
         f"export DART_SDK='{flut_path}/bin/cache/dart-sdk' && "
         f"bash '{post_install_path}' {' '.join(args)}"
     )
-    res = subprocess.run(["bash", "-c", cmd], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    env = isolated_user_env(prefix.parent / ".post-install-user-state")
+    res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     return res
 
 
@@ -195,7 +196,8 @@ def test_post_install_tmpdir_defaults_under_prefix(tmp_path):
         f"export PREFIX='{pref_path}' && "
         f"bash '{post_install_path}' --status"
     )
-    res = subprocess.run(["bash", "-c", cmd], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    env = isolated_user_env(tmp_path / ".post-install-user-state")
+    res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     assert res.returncode == 0, (
         f"--status failed with TMPDIR unset: stdout={res.stdout} stderr={res.stderr}"
     )
@@ -459,7 +461,8 @@ def test_post_install_fresh_shell_unset_dart_sdk(tmp_path):
         f"export PREFIX='{pref_path}' && "
         f"bash '{post_install_path}' --apply"
     )
-    res = subprocess.run(["bash", "-c", cmd], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    env = isolated_user_env(tmp_path / ".post-install-user-state")
+    res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     assert res.returncode == 0, f"post_install failed in fresh shell with unset DART_SDK:\nstdout: {res.stdout}\nstderr: {res.stderr}"
     assert "Dart compiler missing at /bin/dart" not in res.stderr
     assert (flutter_root / "bin" / "cache" / "flutter_tools.stamp").exists()
@@ -482,7 +485,8 @@ def test_post_install_ensures_profile_env_flutter_sh(tmp_path):
         f"export PREFIX='{pref_path}' && "
         f"bash '{post_install_path}' --apply"
     )
-    res = subprocess.run(["bash", "-c", cmd], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    env = isolated_user_env(tmp_path / ".post-install-user-state")
+    res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     assert res.returncode == 0, f"post_install failed: {res.stderr}"
     assert profile_sh.exists(), "post_install.sh failed to create $PREFIX/etc/profile.d/flutter.sh"
     profile_content = profile_sh.read_text(encoding="utf-8")
@@ -509,7 +513,8 @@ def test_post_install_preserves_existing_flutter_sh(tmp_path):
         f"export PREFIX='{pref_path}' && "
         f"bash '{post_install_path}' --apply"
     )
-    res = subprocess.run(["bash", "-c", cmd], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    env = isolated_user_env(tmp_path / ".post-install-user-state")
+    res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     assert res.returncode == 0, f"post_install failed: {res.stderr}"
     assert profile_sh.read_text(encoding="utf-8") == custom_content
 

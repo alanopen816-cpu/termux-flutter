@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).parent.parent
 POST_INSTALL = REPO_ROOT / "scripts" / "install" / "post_install.sh"
 
 
-from conftest import CHROME_CANDIDATES_MARKER, CHROME_FIXTURE, CHROME_LEGACY_PREIMAGE, to_bash_path
+from conftest import CHROME_CANDIDATES_MARKER, CHROME_FIXTURE, CHROME_LEGACY_PREIMAGE, isolated_user_env, to_bash_path
 
 
 def create_mock_env(tmp_path):
@@ -54,9 +54,18 @@ def create_mock_env(tmp_path):
 
     pkg_cfg = flutter_root / "packages" / "flutter_tools" / ".dart_tool" / "package_config.json"
     pkg_cfg.parent.mkdir(parents=True, exist_ok=True)
-    pkg_cfg.write_text("{}\n", newline="\n")
+    pkg_cfg.write_text('{"configVersion": 2, "packages": []}\n', newline="\n")
+    tools_dir = flutter_root / "packages" / "flutter_tools"
+    pubspec = tools_dir / "pubspec.yaml"
+    pubspec.write_text("name: flutter_tools\n", newline="\n")
+    (tools_dir / "pubspec.lock").write_text("# lockfile\n", newline="\n")
 
     (flutter_root / "bin" / "internal" / "engine.version").write_text("dummy_version\n", newline="\n")
+    (flutter_root / "bin" / "cache" / "engine_stamp.json").write_text(
+        '{"build_time_ms": 1770000000000, "git_revision": "dummy_version", '
+        '"git_revision_date": "2026-06-09T00:00:00Z", "content_hash": "dummy_version"}\n',
+        newline="\n",
+    )
     (flutter_root / "version").write_text("3.44.0\n", newline="\n")
 
     # Target files with upstream preimages
@@ -139,7 +148,8 @@ def run_post_install(flutter_root, android_sdk, prefix, args=None):
         f"export DART_SDK='{flut_path}/bin/cache/dart-sdk' && "
         f"bash '{post_install_path}' {' '.join(args)}"
     )
-    res = subprocess.run(["bash", "-c", cmd], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    env = isolated_user_env(prefix.parent / ".post-install-user-state")
+    res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     return res
 
 
@@ -218,11 +228,12 @@ def test_stress_broken_aapt2_symlink_handling(tmp_path):
     assert "Mode B toolchain validation failed" in res.stdout
     assert "Reverting Mode B activation to Mode A" in res.stdout
 
-    # Verify aapt2 symlink was reset to Mode A default (/data/data/com.termux/files/usr/bin/aapt2)
+    # Verify the Mode A fallback points to this fixture's Termux-prefix executable.
     aapt2_post = bt_dir / "aapt2"
-    aapt2_post_bash = to_bash_path(aapt2_post)
+    aapt2_post_bash = f"{to_bash_path(aapt2_post.parent)}/{aapt2_post.name}"
     link_target = subprocess.run(["bash", "-c", f"readlink '{aapt2_post_bash}'"], capture_output=True, text=True).stdout.strip()
-    assert link_target == "/data/data/com.termux/files/usr/bin/aapt2", f"Expected Mode A fallback symlink target, got '{link_target}'"
+    expected_aapt2 = to_bash_path(prefix / "bin" / "aapt2")
+    assert link_target == expected_aapt2, f"Expected Mode A fallback symlink target '{expected_aapt2}', got '{link_target}'"
 
 
 def test_stress_dual_preimage_fresh_install_prepatched(tmp_path):

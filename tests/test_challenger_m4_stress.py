@@ -14,7 +14,7 @@ CHECK_TOOLCHAIN = REPO_ROOT / "scripts" / "ci" / "check_toolchain.sh"
 LIB_COMMON = REPO_ROOT / "scripts" / "install" / "lib_common.sh"
 
 
-from conftest import CHROME_FIXTURE, to_bash_path
+from conftest import CHROME_FIXTURE, isolated_user_env, to_bash_path
 
 
 def write_sh_script(p, content):
@@ -176,9 +176,19 @@ def create_mock_post_install_env(tmp_path):
 
     pkg_cfg = flutter_root / "packages" / "flutter_tools" / ".dart_tool" / "package_config.json"
     pkg_cfg.parent.mkdir(parents=True, exist_ok=True)
-    pkg_cfg.write_text("{}", newline="\n")
+    pkg_cfg.write_text('{"configVersion": 2, "packages": []}', newline="\n")
+    tools_dir = flutter_root / "packages" / "flutter_tools"
+    pubspec = tools_dir / "pubspec.yaml"
+    pubspec.write_text("name: flutter_tools\n", newline="\n")
+    (tools_dir / "pubspec.lock").write_text("# lockfile\n", newline="\n")
 
-    (flutter_root / "bin" / "internal" / "engine.version").write_text("77e2e94772b6eb43759e34ed1ad7da4674e19cab\n", newline="\n")
+    engine_revision = "77e2e94772b6eb43759e34ed1ad7da4674e19cab"
+    (flutter_root / "bin" / "internal" / "engine.version").write_text(engine_revision + "\n", newline="\n")
+    (flutter_root / "bin" / "cache" / "engine_stamp.json").write_text(
+        '{"build_time_ms": 1770000000000, "git_revision": "' + engine_revision + '", '
+        '"git_revision_date": "2026-06-09T00:00:00Z", "content_hash": "' + engine_revision + '"}\n',
+        newline="\n",
+    )
     (flutter_root / "version").write_text("3.44.9\n", newline="\n")
 
     files = {
@@ -263,7 +273,8 @@ def run_post_install(flutter_root, android_sdk, prefix, args=None, extra_env=Non
             env_exports.append(f"export {k}='{v}'")
 
     cmd = f"{' && '.join(env_exports)} && bash '{post_install_path}' {' '.join(args)}"
-    res = subprocess.run(["bash", "-c", cmd], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    env = isolated_user_env(prefix.parent / ".post-install-user-state")
+    res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     return res
 
 

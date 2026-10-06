@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).parent.parent
 POST_INSTALL = REPO_ROOT / "scripts" / "install" / "post_install.sh"
 
 
-from conftest import CHROME_FIXTURE, to_bash_path
+from conftest import CHROME_FIXTURE, isolated_user_env, to_bash_path
 
 
 def create_mock_env(tmp_path):
@@ -161,7 +161,8 @@ def run_post_install(flutter_root, android_sdk, prefix, args=None):
         f"export DART_SDK='{flut_path}/bin/cache/dart-sdk' && "
         f"bash '{post_install_path}' {' '.join(args)}"
     )
-    res = subprocess.run(["bash", "-c", cmd], cwd=str(REPO_ROOT), capture_output=True, text=True)
+    env = isolated_user_env(prefix.parent / ".post-install-user-state")
+    res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     return res
 
 
