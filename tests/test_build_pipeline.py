@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import struct
 import pytest
 import unittest.mock
 from pathlib import Path
@@ -21,7 +22,18 @@ def _write_android_gen_snapshot(root, mode='release'):
     """
     out = Path(root) / 'engine' / 'src' / 'out' / f'android_{mode}_arm64' / 'clang_arm64'
     out.mkdir(parents=True, exist_ok=True)
-    (out / 'gen_snapshot').write_text('dummy')
+    path = out / 'gen_snapshot'
+    interpreter = b'/system/bin/linker64\0'
+    header_size = 64
+    ph_size = 56
+    path.write_bytes(
+        struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01' + bytes(9),
+                    3, 183, 1, 0, header_size, 0, 0, header_size, ph_size, 1, 0, 0, 0)
+        + struct.pack('<IIQQQQQQ', 3, 4, header_size + ph_size, 0, 0,
+                      len(interpreter), len(interpreter), 1)
+        + interpreter
+    )
+    path.chmod(0o755)
 
 
 def test_utils_mode_ordering():

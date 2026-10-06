@@ -2,11 +2,12 @@ import struct
 import io
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import build
-from build import REQUIRED_DEB_ARTIFACTS, validate_android_gen_snapshot
+from build import Build, REQUIRED_DEB_ARTIFACTS, validate_android_gen_snapshot
 
 
 def _write_elf(path, *, machine=183, elf_type=3, interpreter="/system/bin/linker64", executable=True):
@@ -66,6 +67,120 @@ def test_validate_android_gen_snapshot_rejects_missing_file(tmp_path):
     with pytest.raises((ValueError, RuntimeError), match="not found"):
         validate_android_gen_snapshot(tmp_path / "missing")
 
+
+def _empty_build(root, toolchain, sysroot):
+    builder = Build()
+    builder.root = Path(root)
+    builder.toolchain = str(toolchain)
+    builder.jobs = 1
+    builder._sysroot = SimpleNamespace(path=str(sysroot))
+    builder._validate_ndk = lambda _toolchain: None
+    return builder
+
+
+def test_configure_android_passes_separate_termux_host_settings_and_android_target(tmp_path, monkeypatch):
+    root = tmp_path / "flutter"
+    toolchain = tmp_path / "ndk" / "toolchains" / "llvm" / "prebuilt" / "linux-x86_64"
+    sysroot = tmp_path / "termux-sysroot"
+    toolchain.mkdir(parents=True)
+    sysroot.mkdir()
+    calls = []
+    monkeypatch.setattr(build.subprocess, "run", lambda cmd, **kw: calls.append((cmd, kw)))
+
+    builder = _empty_build(root, toolchain, sysroot)
+    builder.configure_android(mode="release")
+
+    cmd = calls[0][0]
+    joined = " ".join(cmd)
+    assert "--android" in cmd and "--android-cpu" in cmd
+    assert 'termux_cross_host=true' in joined
+    assert f'termux_host_toolchain="{toolchain}"' in joined
+    assert f'termux_host_sysroot="{sysroot}"' in joined
+    assert "--android-cpu arm64" in joined
+
+
+def test_non_cross_host_toolchain_keeps_legacy_custom_toolchain_contract():
+    patch = Path("patches/3.47.2/engine.patch").read_text()
+    assert 'assert(defined(custom_toolchain) && custom_toolchain != "")' in patch
+    assert 'prefix = "$custom_toolchain/bin"' in patch
+    assert 'if (termux_cross_host)' in patch
+
+
+def test_build_android_gen_snapshot_uses_gn_outputs_for_ninja_target(tmp_path, monkeypatch):
+    root = tmp_path / "flutter"
+    out = root / "engine/src/out/android_release_arm64"
+    relative_output = "target/host/gen_snapshot"
+    output = out / relative_output
+    output.parent.mkdir(parents=True)
+    calls = []
+    working_dirs = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        working_dirs.append(kwargs.get("cwd"))
+        if "outputs" in cmd:
+            return SimpleNamespace(stdout=relative_output + "\n")
+        if cmd[0] == "ninja":
+            _write_elf(output)
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+    builder = _empty_build(root, tmp_path / "ndk", tmp_path / "sysroot")
+
+    canonical = Path(builder.build_android_gen_snapshot(mode="release"))
+
+    expected_gn = root.resolve() / "engine/src/flutter/third_party/gn/gn"
+    assert Path(calls[0][0]) == expected_gn
+    assert calls[0][1:] == ["outputs", str(out.resolve()), (
+        "//flutter/third_party/dart/runtime/bin:gen_snapshot"
+        "(//build/toolchain/termux:arm64)")]
+    assert calls[0][1] == "outputs"
+    assert working_dirs[0] == root.resolve() / "engine/src"
+    assert calls[1][0] == "ninja"
+    assert calls[1][3] == relative_output
+    assert canonical.exists()
+    validate_android_gen_snapshot(canonical)
+
+
+def test_x64_gen_snapshot_output_is_rejected_without_copy(tmp_path, monkeypatch):
+    root = tmp_path / "flutter"
+    out = root / "engine/src/out/android_release_arm64"
+    relative_output = "clang_arm64/exe.stripped/gen_snapshot"
+    output = out / relative_output
+    output.parent.mkdir(parents=True)
+    monkeypatch.setattr(
+        build.subprocess, "run",
+        lambda cmd, **kwargs: (
+            SimpleNamespace(stdout=relative_output + "\n") if "outputs" in cmd
+            else _write_elf(output, machine=62)),
+    )
+    builder = _empty_build(root, tmp_path / "ndk", tmp_path / "sysroot")
+
+    with pytest.raises(ValueError, match="AArch64"):
+        builder.build_android_gen_snapshot(mode="release")
+    assert not (out / "clang_arm64/gen_snapshot").exists()
+
+
+def test_valid_canonical_output_is_not_copied_onto_itself(tmp_path, monkeypatch):
+    root = tmp_path / "flutter"
+    out = root / "engine/src/out/android_release_arm64"
+    relative_output = "clang_arm64/gen_snapshot"
+    output = out / relative_output
+    output.parent.mkdir(parents=True)
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if "outputs" in cmd:
+            return SimpleNamespace(stdout=relative_output + "\n")
+        _write_elf(output)
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+    builder = _empty_build(root, tmp_path / "ndk", tmp_path / "sysroot")
+    result = Path(builder.build_android_gen_snapshot(mode="release"))
+
+    assert result == output
+    assert result.exists()
+    assert len(calls) == 2
 
 
 def test_required_deb_artifacts_include_release_and_profile_generators():

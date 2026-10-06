@@ -170,7 +170,6 @@ def validate_android_gen_snapshot(path):
 
 
 
-
 def _ar_members(path):
     with open(path, 'rb') as f:
         if f.read(8) != b'!<arch>\n':
@@ -1498,9 +1497,10 @@ class Build:
             # Note: no --target-toolchain for Android (uses default)
             # Termux cross-host settings
             '--gn-args', 'termux_cross_host=true',
+            '--gn-args', f'termux_host_toolchain="{toolchain}"',
+            '--gn-args', f'termux_host_sysroot="{sysroot}"',
             '--gn-args', f'android_ndk_root="{ndk_root}"',
             '--gn-args', f'android_clang_rt_version="{clang_rt_version}"',
-            '--gn-args', f'termux_ndk_path="{toolchain}"',
             '--gn-args', f'target_sysroot="{sysroot}"',
             '--gn-args', 'symbol_level=0',
             '--gn-args', 'use_default_linux_sysroot=false',
@@ -1521,47 +1521,56 @@ class Build:
         This produces gen_snapshot that can be run on Termux
         and generates Android ARM64 AOT code.
         """
-        root = root or self.root
+        root = Path(root or self.root).resolve()
         jobs = jobs or self.jobs
         out_dir = f'android_{mode}_{arch}'
-        out_path = os.path.join(root, 'engine', 'src', 'out', out_dir)
+        engine_src = root / 'engine' / 'src'
+        out_path = str(engine_src / 'out' / out_dir)
+        gn_binary = engine_src / 'flutter' / 'third_party' / 'gn' / 'gn'
 
-        cmd = [
-            'ninja', '-C', out_path,
-            'flutter/third_party/dart/runtime/bin:gen_snapshot',
-        ]
+        gen_snapshot_label = (
+            '//flutter/third_party/dart/runtime/bin:gen_snapshot'
+            '(//build/toolchain/termux:arm64)')
+        outputs = subprocess.run(
+            [str(gn_binary), 'outputs', out_path, gen_snapshot_label],
+            cwd=engine_src, check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        out_root = Path(os.path.abspath(out_path))
+        ninja_targets = []
+        for output in outputs:
+            candidate = Path(output.strip())
+            if not output.strip() or candidate.name != 'gen_snapshot':
+                continue
+            if not candidate.is_absolute():
+                candidate = out_root / candidate
+            candidate = Path(os.path.abspath(candidate))
+            try:
+                ninja_targets.append(candidate.relative_to(out_root).as_posix())
+            except ValueError:
+                continue
+        if len(ninja_targets) != 1:
+            raise RuntimeError(
+                'GN did not resolve exactly one in-output gen_snapshot executable '
+                f'for {gen_snapshot_label}; returned {outputs!r}')
+
+        cmd = ['ninja', '-C', out_path, ninja_targets[0]]
         if jobs:
             cmd.append(f'-j{jobs}')
 
         logger.info(f'Building Android gen_snapshot: {out_dir}')
         subprocess.run(cmd, check=True)
 
-        # Find and copy gen_snapshot to the location expected by package.yaml
-        # package.yaml expects: android_release_arm64/clang_arm64/gen_snapshot
-        possible_paths = [
-            os.path.join(out_path, 'exe.stripped', 'gen_snapshot'),
-            os.path.join(out_path, 'gen_snapshot'),
-            os.path.join(out_path, 'clang_x64', 'exe.stripped', 'gen_snapshot'),
-            os.path.join(out_path, 'clang_x64', 'gen_snapshot'),
-        ]
+        gen_snapshot_src = Path(out_root / ninja_targets[0])
+        validate_android_gen_snapshot(gen_snapshot_src)
 
-        gen_snapshot_src = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                gen_snapshot_src = path
-                break
-
-        if gen_snapshot_src:
-            # Copy to the location expected by package.yaml
-            target_dir = os.path.join(out_path, 'clang_arm64')
-            os.makedirs(target_dir, exist_ok=True)
-            target_path = os.path.join(target_dir, 'gen_snapshot')
+        # Normalize the verified host executable to package.yaml's stable path.
+        target_path = Path(out_path) / 'clang_arm64' / 'gen_snapshot'
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.realpath(gen_snapshot_src) != os.path.realpath(target_path):
             shutil.copy(gen_snapshot_src, target_path)
-            logger.info(f'✓ gen_snapshot copied to {target_path}')
-            return target_path
-
-        logger.warning('gen_snapshot not found at expected paths')
-        return None
+        validate_android_gen_snapshot(target_path)
+        logger.info(f'✓ gen_snapshot copied to {target_path}')
+        return str(target_path)
 
     def sync_wsl(self):
         """Sync files from Windows to WSL before debuild.
@@ -1791,7 +1800,14 @@ class Build:
         # Step 11: configure and build android gen_snapshot release
         android_rel_dir = self.root / 'engine/src/out/android_release_arm64'
         android_rel_gen = android_rel_dir / 'clang_arm64/gen_snapshot'
-        if not force and android_rel_gen.exists() and self.verify_stage_receipt(android_rel_dir, [android_rel_gen]):
+        android_rel_valid = False
+        if android_rel_gen.exists():
+            try:
+                validate_android_gen_snapshot(android_rel_gen)
+                android_rel_valid = True
+            except (ValueError, RuntimeError) as exc:
+                logger.warning(f'[11/{total}] cached Android release gen_snapshot is invalid; rebuilding: {exc}')
+        if not force and android_rel_valid and self.verify_stage_receipt(android_rel_dir, [android_rel_gen]):
             logger.info(f'[11/{total}] android gen_snapshot release output already exists, skipping (use --force to rebuild).')
         else:
             rebuilt_any_artifact[0] = True
@@ -1809,7 +1825,14 @@ class Build:
         # contract is clang_arm64/gen_snapshot; build_android_gen_snapshot()
         # normalizes both layouts into that directory.
         android_prof_gen = android_prof_dir / 'clang_arm64/gen_snapshot'
-        if not force and android_prof_gen.exists() and self.verify_stage_receipt(android_prof_dir, [android_prof_gen]):
+        android_prof_valid = False
+        if android_prof_gen.exists():
+            try:
+                validate_android_gen_snapshot(android_prof_gen)
+                android_prof_valid = True
+            except (ValueError, RuntimeError) as exc:
+                logger.warning(f'[12/{total}] cached Android profile gen_snapshot is invalid; rebuilding: {exc}')
+        if not force and android_prof_valid and self.verify_stage_receipt(android_prof_dir, [android_prof_gen]):
             logger.info(f'[12/{total}] android gen_snapshot profile output already exists, skipping (use --force to rebuild).')
         else:
             rebuilt_any_artifact[0] = True

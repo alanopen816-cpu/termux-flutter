@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import hashlib
+import struct
 import pytest
 import subprocess
 from pathlib import Path
@@ -13,6 +14,25 @@ sys.path.insert(0, str(REPO_ROOT))
 import utils
 import package
 from build import Build
+
+
+def _write_valid_android_gen_snapshot(path):
+    """Write a minimal executable ARM64 ELF with Termux's Android interpreter."""
+    interpreter = b"/system/bin/linker64\0"
+    header_size, program_header_size = 64, 56
+    ident = b"\x7fELF\x02\x01\x01" + bytes(9)
+    header = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        ident, 3, 183, 1, 0, header_size, 0, 0,
+        header_size, program_header_size, 1, 0, 0, 0,
+    )
+    program_header = struct.pack(
+        "<IIQQQQQQ",
+        3, 4, header_size + program_header_size, 0, 0,
+        len(interpreter), len(interpreter), 1,
+    )
+    path.write_bytes(header + program_header + interpreter)
+    path.chmod(0o755)
 
 
 # ============================================================================
@@ -374,7 +394,10 @@ def test_adv_build_all_mtime_staleness_comprehensive(tmp_path, monkeypatch):
 
     for p in all_artifacts:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("content")
+        if p.name == "gen_snapshot" and any(parent.name.startswith("android_") for parent in p.parents):
+            _write_valid_android_gen_snapshot(p)
+        else:
+            p.write_text("content")
 
     (out_debug / "gen" / "dart-pkg" / "sky_engine").mkdir(parents=True, exist_ok=True)
     (root / ".gclient_sync.receipt.json").write_text(json.dumps({"tag": "3.44.9", "completed": True, "timestamp": time.time()}))

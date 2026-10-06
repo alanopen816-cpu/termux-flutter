@@ -25,7 +25,7 @@ index 2b0d94e1a03..95c08f25c5d 100644
 -if (is_linux) {
 +import("//build/config/termux/termux.gni")
 +
-+if (is_termux) {
++if (is_termux || termux_cross_host) {
 +  _native_compiler_configs += [ "//build/config/termux:sdk" ]
 +} else if (is_linux) {
    _native_compiler_configs += [ "//build/config/linux:sdk" ]
@@ -52,11 +52,15 @@ index 2b0d94e1a03..95c08f25c5d 100644
    assert(custom_sysroot != "")
    assert(custom_target_triple != "")
    host_toolchain = "//build/toolchain/linux:clang_$host_cpu"
-@@ -648,6 +655,9 @@ if (custom_toolchain != "") {
+@@ -648,6 +655,13 @@ if (custom_toolchain != "") {
  } else {
    assert(false, "Toolchain not set because of unknown platform.")
  }
-+if (is_termux_host) {
++if (termux_cross_host) {
++  # Android remains the default/target toolchain. Only host-side tools such as
++  # gen_snapshot are routed through the Termux ARM64 host toolchain.
++  host_toolchain = "//build/toolchain/termux:arm64"
++} else if (is_termux_host) {
 +  host_toolchain = "//build/toolchain/termux:$host_cpu"
 +}
  
@@ -97,11 +101,13 @@ diff --git a/engine/src/build/config/sysroot.gni b/engine/src/build/config/sysro
 index 12c8df99f44..5e87f79075c 100644
 --- a/engine/src/build/config/sysroot.gni
 +++ b/engine/src/build/config/sysroot.gni
-@@ -17,6 +17,8 @@ declare_args() {
+@@ -17,6 +17,10 @@ declare_args() {
  
 -if (current_toolchain == default_toolchain && target_sysroot != "") {
-+if (!is_android && current_toolchain == default_toolchain && target_sysroot != "") {
-   sysroot = target_sysroot
++if (termux_cross_host && current_toolchain == host_toolchain && termux_host_sysroot != "") {
++  sysroot = termux_host_sysroot
++} else if (!is_android && current_toolchain == default_toolchain && target_sysroot != "") {
+  sysroot = target_sysroot
 +} else if (is_termux && custom_sysroot != "") {
 +  sysroot = custom_sysroot
  } else if (is_android) {
@@ -112,7 +118,7 @@ new file mode 100644
 index 00000000000..2503dc32083
 --- /dev/null
 +++ b/engine/src/build/config/termux/BUILD.gn
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,190 @@
 +import("//build/config/termux/termux.gni")
 +import("//build/config/sysroot.gni")
 +import("//build/config/profiler.gni")
@@ -252,7 +258,11 @@ index 00000000000..2503dc32083
 +      "-stdlib=libstdc++",
 +      "-Wl,--warn-shared-textrel"
 +    ]
-+    lib_dirs = [ "$custom_toolchain/lib/clang/18/lib/linux/" ]
++    if (termux_cross_host) {
++      lib_dirs = [ "$termux_host_toolchain/lib/clang/$android_clang_rt_version/lib/linux/" ]
++    } else {
++      lib_dirs = [ "$custom_toolchain/lib/clang/18/lib/linux/" ]
++    }
 +    include_dirs = [
 +      "//flutter/third_party/libcxx/include",
 +      "//flutter/third_party/libcxxabi/include",
@@ -274,20 +284,27 @@ index 00000000000..2503dc32083
 +  }
 +}
 +
-+# Termux SDK config — only apply sysroot/libs to target toolchain    
++# Termux SDK config — only apply sysroot/libs to the Termux toolchain.
 +config("sdk") {
 +  if (current_toolchain == "//build/toolchain/termux:${current_cpu}") {
 +    cflags = []
 +    ldflags = [ "-Wl,-rpath=/data/data/com.termux/files/usr/lib" ]
 +    libs = [ "log", "m" ]
-+    lib_dirs = [ "$custom_toolchain/lib/clang/18/lib/linux/" ]
-+    if (defined(target_sysroot) && target_sysroot != "") {
-+      cflags += [ "--sysroot=" + target_sysroot ]
-+      ldflags += [ "--sysroot=" + target_sysroot ]
-+    }
-+    if (defined(custom_sysroot) && custom_sysroot != "") {
-+      cflags += [ "-idirafter$custom_sysroot/usr/include" ]
-+      lib_dirs += [ "$custom_sysroot/usr/lib" ]
++    if (termux_cross_host) {
++      lib_dirs = [ "$termux_host_toolchain/lib/clang/$android_clang_rt_version/lib/linux/" ]
++      cflags += [ "--sysroot=" + termux_host_sysroot ]
++      ldflags += [ "--sysroot=" + termux_host_sysroot ]
++      lib_dirs += [ "$termux_host_sysroot/usr/lib" ]
++    } else {
++      lib_dirs = [ "$custom_toolchain/lib/clang/18/lib/linux/" ]
++      if (defined(target_sysroot) && target_sysroot != "") {
++        cflags += [ "--sysroot=" + target_sysroot ]
++        ldflags += [ "--sysroot=" + target_sysroot ]
++      }
++      if (defined(custom_sysroot) && custom_sysroot != "") {
++        cflags += [ "-idirafter$custom_sysroot/usr/include" ]
++        lib_dirs += [ "$custom_sysroot/usr/lib" ]
++      }
 +    }
 +  }
 +}
@@ -297,20 +314,22 @@ new file mode 100644
 index 00000000000..0d97976c4ac
 --- /dev/null
 +++ b/engine/src/build/config/termux/termux.gni
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,9 @@
 +declare_args() {
 +  termux_api_level = 26
 +
 +  is_termux = false
 +  is_termux_host = false
 +  termux_cross_host = false
++  termux_host_toolchain = ""
++  termux_host_sysroot = ""
 +}
 diff --git a/engine/src/build/toolchain/termux/BUILD.gn b/engine/src/build/toolchain/termux/BUILD.gn
 new file mode 100644
 index 00000000000..564c5829578
 --- /dev/null
 +++ b/engine/src/build/toolchain/termux/BUILD.gn
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,45 @@
 +import("//build/toolchain/gcc_toolchain.gni")
 +import("//build/config/android/config.gni")
 +import("//build/config/termux/termux.gni")
@@ -318,13 +337,18 @@ index 00000000000..564c5829578
 +
 +template("termux_toolchain") {
 +  gcc_toolchain(target_name) {
-+    assert(defined(custom_toolchain) && custom_toolchain != "")
++    if (termux_cross_host) {
++      assert(defined(termux_host_toolchain) && termux_host_toolchain != "")
++      prefix = "$termux_host_toolchain/bin"
++    } else {
++      assert(defined(custom_toolchain) && custom_toolchain != "")
++      prefix = "$custom_toolchain/bin"
++    }
 +
 +    is_clang = true
 +    toolchain_os = "linux"
 +    toolchain_cpu = invoker.toolchain_cpu
 +
-+    prefix = "$custom_toolchain/bin"
 +    cc = prefix + "/clang"
 +    cxx = prefix + "/clang++"
 +    asm = prefix + "/clang"

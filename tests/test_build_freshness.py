@@ -4,6 +4,7 @@ import time
 import json
 import hashlib
 import tempfile
+import struct
 from pathlib import Path
 import pytest
 
@@ -11,6 +12,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import utils
 from build import Build
+
+
+def _write_android_elf(path):
+    interpreter = b"/system/bin/linker64\0"
+    header_size, ph_size = 64, 56
+    path.write_bytes(
+        struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01' + bytes(9),
+                    3, 183, 1, 0, header_size, 0, 0, header_size, ph_size, 1, 0, 0, 0)
+        + struct.pack('<IIQQQQQQ', 3, 4, header_size + ph_size, 0, 0,
+                      len(interpreter), len(interpreter), 1)
+        + interpreter
+    )
+    path.chmod(0o755)
 
 
 # ============================================================================
@@ -284,7 +298,8 @@ def test_inputs_older_skips_debuild(tmp_path):
     assert not (engine_output.stat().st_mtime > deb_mtime)
 
 
-def test_build_all_deb_exists_no_typeerror_and_skips_when_fresh(tmp_path, monkeypatch):
+@pytest.mark.parametrize("invalid_android_cache", [False, True])
+def test_build_all_android_gen_snapshot_cache_validation(tmp_path, monkeypatch, invalid_android_cache):
     """Proves build_all with existing deb_file executes freshness check without TypeError and skips debuild if fresh."""
     root = tmp_path / "flutter"
     root.mkdir()
@@ -315,7 +330,14 @@ def test_build_all_deb_exists_no_typeerror_and_skips_when_fresh(tmp_path, monkey
         out_android_prof / "gen_snapshot",
     ]:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("dummy")
+        if p.name == "gen_snapshot" and any(parent.name.startswith("android_") for parent in p.parents):
+            if invalid_android_cache and p == out_android_rel / "gen_snapshot":
+                p.write_text("stale x64 output")
+                p.chmod(0o755)
+            else:
+                _write_android_elf(p)
+        else:
+            p.write_text("dummy")
 
     (out_debug / "gen" / "dart-pkg" / "sky_engine").mkdir(parents=True, exist_ok=True)
     (root / ".gclient_sync.receipt.json").write_text(json.dumps({"tag": "3.44.9", "completed": True, "timestamp": time.time()}))
@@ -365,15 +387,21 @@ def test_build_all_deb_exists_no_typeerror_and_skips_when_fresh(tmp_path, monkey
     b.build_dart = lambda **kw: None
     b.build_impellerc = lambda **kw: None
     b.build_const_finder = lambda **kw: None
-    b.configure_android = lambda **kw: None
+    android_configures = []
+    b.configure_android = lambda **kw: android_configures.append(kw)
     b.build_android_gen_snapshot = lambda **kw: None
 
     debuild_called = []
     b.debuild = lambda **kw: debuild_called.append(True)
 
     b.build_all(arch="arm64")
-    # deb_file is newer than all artifacts -> debuild skipped
-    assert len(debuild_called) == 0
+    if invalid_android_cache:
+        assert {"mode": "release", "arch": "arm64"} in android_configures
+        assert len(debuild_called) == 1
+    else:
+        # The valid canonical binary and fresh deb are reused without rebuilding.
+        assert android_configures == []
+        assert len(debuild_called) == 0
 
 
 def test_build_all_deb_exists_newer_input_triggers_debuild(tmp_path, monkeypatch):
@@ -406,7 +434,10 @@ def test_build_all_deb_exists_newer_input_triggers_debuild(tmp_path, monkeypatch
         out_android_prof / "gen_snapshot",
     ]:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("dummy")
+        if p.name == "gen_snapshot" and any(parent.name.startswith("android_") for parent in p.parents):
+            _write_android_elf(p)
+        else:
+            p.write_text("dummy")
 
     (out_debug / "gen" / "dart-pkg" / "sky_engine").mkdir(parents=True, exist_ok=True)
     (root / ".gclient_sync.receipt.json").write_text(json.dumps({"tag": "3.44.9", "completed": True, "timestamp": time.time()}))
