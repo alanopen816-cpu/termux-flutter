@@ -17,6 +17,7 @@ import tomllib
 import platform
 import posixpath
 import subprocess
+import struct
 from loguru import logger
 from pathlib import Path
 from sysroot import Sysroot
@@ -113,7 +114,60 @@ REQUIRED_DEB_ARTIFACTS = (
     'opt/flutter/bin/cache/dart-sdk/bin/dart',
     'opt/flutter/bin/cache/dart-sdk/bin/dartvm',
     'opt/flutter/bin/cache/dart-sdk/bin/dartaotruntime',
+    'opt/flutter/bin/cache/artifacts/engine/android-arm64-release/linux-arm64/gen_snapshot',
+    'opt/flutter/bin/cache/artifacts/engine/android-arm64-profile/linux-arm64/gen_snapshot',
 )
+
+
+def _validate_android_gen_snapshot_bytes(data, *, executable, source):
+    """Validate a Termux-hosted ARM64 ELF before it is reused or packaged."""
+    if not executable:
+        raise RuntimeError(f'Android gen_snapshot is not executable: {source}')
+    header_format = '<16sHHIQQQIHHHHHH'
+    header_size = struct.calcsize(header_format)
+    if len(data) < header_size:
+        raise ValueError(f'Android gen_snapshot is not a valid ELF64 file: {source}')
+    (ident, elf_type, machine, version, _entry, phoff, _shoff, _flags,
+     ehsize, phentsize, phnum, _shentsize, _shnum, _shstrndx) = struct.unpack_from(
+        header_format, data)
+    if ident[:4] != b'\x7fELF' or ident[4:6] != b'\x02\x01' or version != 1:
+        raise ValueError(f'Android gen_snapshot must be ELF64 little-endian: {source}')
+    if machine != 183:
+        raise ValueError(f'Android gen_snapshot must target AArch64 (EM_AARCH64): {source}')
+    if elf_type not in (2, 3) or ehsize < header_size:
+        raise ValueError(f'Android gen_snapshot has an invalid executable ELF header: {source}')
+    ph_format = '<IIQQQQQQ'
+    minimum_phentsize = struct.calcsize(ph_format)
+    if phentsize < minimum_phentsize or phoff + phentsize * phnum > len(data):
+        raise ValueError(f'Android gen_snapshot has a truncated ELF program table: {source}')
+    interpreter = None
+    for index in range(phnum):
+        offset = phoff + index * phentsize
+        p_type, _p_flags, p_offset, _vaddr, _paddr, p_filesz, _memsz, _align = struct.unpack_from(
+            ph_format, data, offset)
+        if p_type == 3:  # PT_INTERP
+            if p_filesz == 0 or p_offset + p_filesz > len(data):
+                raise ValueError(f'Android gen_snapshot has an invalid ELF interpreter: {source}')
+            raw_interpreter = data[p_offset:p_offset + p_filesz]
+            if not raw_interpreter.endswith(b'\0'):
+                raise ValueError(f'Android gen_snapshot has an unterminated ELF interpreter: {source}')
+            interpreter = raw_interpreter[:-1].decode('ascii', errors='replace')
+            break
+    if interpreter != '/system/bin/linker64':
+        raise ValueError(
+            f'Android gen_snapshot ELF interpreter must be /system/bin/linker64, '
+            f'found {interpreter!r}: {source}')
+
+
+def validate_android_gen_snapshot(path):
+    """Require an executable, dynamically linked Android ARM64 host generator."""
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(f'Android gen_snapshot not found: {path}')
+    mode = path.stat().st_mode
+    _validate_android_gen_snapshot_bytes(
+        path.read_bytes(), executable=bool(mode & 0o111), source=path)
+
 
 
 
@@ -170,6 +224,15 @@ def validate_deb_artifacts(path):
         raise RuntimeError(
             'deb runtime artifact(s) are not executable: '
             + ', '.join(non_executable))
+
+    for suffix in REQUIRED_DEB_ARTIFACTS[-2:]:
+        member = found[suffix]
+        with tarfile.open(fileobj=io.BytesIO(data_member), mode='r:*') as data_tar:
+            stream = data_tar.extractfile(member)
+            if stream is None:
+                raise RuntimeError(f'deb artifact could not be read: {suffix}')
+            _validate_android_gen_snapshot_bytes(
+                stream.read(), executable=bool(member.mode & 0o111), source=suffix)
 
     logger.info(
         '✓ Validated deb runtime artifacts: '

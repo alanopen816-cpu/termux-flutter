@@ -213,6 +213,23 @@ jobs:
           stat -c '%s' "$DEB" | tee "${DEB}.size.txt"
           echo "deb=$DEB" >> "$GITHUB_OUTPUT"
 
+      - name: Verify packaged Android ARM64 gen_snapshot binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEB="${{ steps.artifact.outputs.deb }}"
+          ROOT="$(mktemp -d)"
+          trap 'rm -rf "$ROOT"' EXIT
+          dpkg-deb -x "$DEB" "$ROOT"
+          for MODE in release profile; do
+            BIN="$ROOT/data/data/com.termux/files/usr/opt/flutter/bin/cache/artifacts/engine/android-arm64-${MODE}/linux-arm64/gen_snapshot"
+            test -x "$BIN"
+            file "$BIN" | grep -Eq 'ELF 64-bit LSB.*ARM aarch64'
+            readelf -h "$BIN" | grep -Eq 'Machine:[[:space:]]+AArch64'
+            readelf -l "$BIN" | grep -Fq 'Requesting program interpreter: /system/bin/linker64'
+            echo "Verified packaged Android ARM64 ${MODE} gen_snapshot: $BIN"
+          done
+
       - name: Generate build metadata
         id: metadata
         shell: bash
