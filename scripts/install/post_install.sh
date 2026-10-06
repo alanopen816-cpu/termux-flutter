@@ -350,9 +350,80 @@ patch_plugin_utils() {
 register_patch "plugin_utils" "$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main/kotlin/FlutterPluginUtils.kt" patch_plugin_utils
 
 patch_flutter_cache() {
-    if grep -F -q "_platform.isAndroid" "$1"; then return 0; fi
-    grep -q "artifacts\[_platform.operatingSystem\]" "$1" || return 1
-    sed -i "s|final List<String>? binaryDirs = artifacts\[_platform.operatingSystem\];|final List<String>? binaryDirs = artifacts[_platform.isAndroid ? 'linux' : _platform.operatingSystem]; // Termux: map Android host to Linux artifacts|" "$1"
+    local file="$1"
+    local font_preimage='final List<String>? binaryDirs = artifacts[_platform.operatingSystem];'
+    local font_postimage='final List<String>? binaryDirs = artifacts[_platform.isAndroid ? "linux" : _platform.operatingSystem]; // Termux: map Android host to Linux artifacts.'
+    local font_legacy_single="final List<String>? binaryDirs = artifacts[_platform.isAndroid ? 'linux' : _platform.operatingSystem]; // Termux: map Android host to Linux artifacts"
+    local font_legacy_single_period="${font_legacy_single}."
+    local font_legacy_double="${font_postimage%.}"
+
+    # Keep the existing font-subset adaptation independent of the Android snapshot
+    # correction so installations carrying only one patch can safely advance.
+    local font_tmp
+    font_tmp=$(mktemp "$TMPDIR/flutter_font_cache.XXXXXX")
+    if ! awk -v pre="$font_preimage" -v post="$font_postimage" \
+        -v legacy_single="$font_legacy_single" -v legacy_single_period="$font_legacy_single_period" \
+        -v legacy_double="$font_legacy_double" '
+        {
+            original = $0
+            indentation = original
+            sub(/[^[:space:]].*$/, "", indentation)
+            normalized = original
+            sub(/^[[:space:]]*/, "", normalized)
+        }
+        normalized == pre { print indentation post; recognized++; next }
+        normalized == post || normalized == legacy_single || normalized == legacy_single_period || normalized == legacy_double {
+            print original
+            recognized++
+            next
+        }
+        { print }
+        END { if (recognized != 1) exit 1 }
+    ' "$file" > "$font_tmp"; then
+        rm -f "$font_tmp"
+        return 1
+    fi
+    mv "$font_tmp" "$file"
+
+    if grep -F -q 'termuxLinuxArm64Host' "$file"; then
+        grep -F -q "cache.getHostPlatformArchName() == 'linux-arm64'" "$file" &&
+            grep -F -q 'if (!termuxLinuxArm64Host) ..._linuxBinaryDirs' "$file" &&
+            grep -F -q "sdk.first != 'linux-x64'" "$file" &&
+            grep -F -q '_platform.isLinux && !termuxLinuxArm64Host' "$file"
+        return $?
+    fi
+    grep -F -q 'class AndroidGenSnapshotArtifacts extends EngineCachedArtifact {' "$file" || return 1
+    grep -F -q '..._linuxBinaryDirs,' "$file" || return 1
+    grep -F -q 'else if (_platform.isLinux)' "$file" || return 1
+
+    local transformed
+    transformed=$(mktemp "$TMPDIR/flutter_cache.XXXXXX")
+    awk '
+        /^class AndroidGenSnapshotArtifacts extends EngineCachedArtifact \{/ { in_class = 1 }
+        in_class && /^  List<List<String>> getBinaryDirs\(\) \{$/ {
+            print
+            print "    final bool termuxLinuxArm64Host = cache.getHostPlatformArchName() == '\''linux-arm64'\'';"
+            print "    final List<List<String>> termuxDartSdks = termuxLinuxArm64Host ? _dartSdks.where((sdk) => sdk.first != " sprintf("%c", 39) "linux-x64" sprintf("%c", 39) ").toList() : _dartSdks;"
+            next
+        }
+        in_class && !linux_list_done && /^        \.\.\._linuxBinaryDirs,$/ {
+            print "        if (!termuxLinuxArm64Host) ..._linuxBinaryDirs,"
+            linux_list_done = 1
+            next
+        }
+        in_class && /^        \.\.\._dartSdks,$/ {
+            print "        ...termuxDartSdks,"
+            next
+        }
+        in_class && /^      else if \(_platform\.isLinux\)$/ {
+            print "      else if (_platform.isLinux && !termuxLinuxArm64Host)"
+            next
+        }
+        in_class && /^\}$/ { in_class = 0 }
+        { print }
+    ' "$file" > "$transformed" && mv "$transformed" "$file"
+    grep -F -q 'if (!termuxLinuxArm64Host) ..._linuxBinaryDirs' "$file" &&
+        grep -F -q '_platform.isLinux && !termuxLinuxArm64Host' "$file"
 }
 register_patch "flutter_cache" "$FLUTTER_ROOT/packages/flutter_tools/lib/src/flutter_cache.dart" patch_flutter_cache
 

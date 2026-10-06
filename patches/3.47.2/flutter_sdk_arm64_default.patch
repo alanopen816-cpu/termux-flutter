@@ -55,6 +55,32 @@ index bf144dbc2a5..6f099da0e54 100644
        if (binaryDirs == null) {
          throwToolExit('Unsupported operating system: ${_platform.operatingSystem}');
        }
+diff --git a/packages/flutter_tools/lib/src/flutter_cache.dart b/packages/flutter_tools/lib/src/flutter_cache.dart
+index bf144dbc2a5..6f099da0e54 100644
+--- a/packages/flutter_tools/lib/src/flutter_cache.dart
++++ b/packages/flutter_tools/lib/src/flutter_cache.dart
+@@ -387,16 +387,18 @@ class AndroidGenSnapshotArtifacts extends EngineCachedArtifact {
+   @override
+   List<List<String>> getBinaryDirs() {
++    final bool termuxLinuxArm64Host = cache.getHostPlatformArchName() == 'linux-arm64';
++    final List<List<String>> termuxDartSdks = termuxLinuxArm64Host ? _dartSdks.where((sdk) => sdk.first != 'linux-x64').toList() : _dartSdks;
+     return <List<String>>[
+       if (cache.includeAllPlatforms) ...<List<String>>[
+         ..._osxBinaryDirs,
+-        ..._linuxBinaryDirs,
++        if (!termuxLinuxArm64Host) ..._linuxBinaryDirs,
+         ..._windowsBinaryDirs,
+-        ..._dartSdks,
++        ...termuxDartSdks,
+       ] else if (_platform.isWindows)
+         ..._windowsBinaryDirs
+       else if (_platform.isMacOS)
+         ..._osxBinaryDirs
+-      else if (_platform.isLinux)
++      else if (_platform.isLinux && !termuxLinuxArm64Host)
+         ..._linuxBinaryDirs,
+     ];
+   }
 diff --git a/packages/flutter_tools/lib/src/artifacts.dart b/packages/flutter_tools/lib/src/artifacts.dart
 index 6d3f133c3ed..cfd42289819 100644
 --- a/packages/flutter_tools/lib/src/artifacts.dart

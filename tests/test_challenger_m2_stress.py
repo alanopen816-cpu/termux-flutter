@@ -74,7 +74,26 @@ def create_mock_env(tmp_path):
         flutter_root / "packages" / "flutter_tools" / "gradle" / "src" / "main" / "kotlin" / "FlutterPluginUtils.kt":
             "fun forceNdkDownload() {\n val forcingNotRequired: Boolean = true\n }\n",
         flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "flutter_cache.dart":
-            "final List<String>? binaryDirs = artifacts[_platform.operatingSystem];\n",
+            """final List<String>? binaryDirs = artifacts[_platform.operatingSystem];
+class AndroidGenSnapshotArtifacts extends EngineCachedArtifact {
+  @override
+  List<List<String>> getBinaryDirs() {
+    return <List<String>>[
+      if (cache.includeAllPlatforms) ...<List<String>>[
+        ..._osxBinaryDirs,
+        ..._linuxBinaryDirs,
+        ..._windowsBinaryDirs,
+        ..._dartSdks,
+      ] else if (_platform.isWindows)
+        ..._windowsBinaryDirs
+      else if (_platform.isMacOS)
+        ..._osxBinaryDirs
+      else if (_platform.isLinux)
+        ..._linuxBinaryDirs,
+    ];
+  }
+}
+""",
         flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "artifacts.dart":
             "if (platform.isLinux) {\n",
         flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "build_info.dart":
@@ -220,8 +239,14 @@ def test_stress_dual_preimage_fresh_install_prepatched(tmp_path):
     (flutter_root / "packages" / "flutter_tools" / "gradle" / "src" / "main" / "kotlin" / "FlutterPluginUtils.kt").write_text(
         'fun forceNdkDownload() {\n        if (System.getenv("TERMUX_NDK_PROVISIONING") == null) return // Termux: NDK already installed, skip CMake trick\n val forcingNotRequired: Boolean = true\n }\n'
     )
-    (flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "flutter_cache.dart").write_text(
-        "final List<String>? binaryDirs = artifacts[_platform.isAndroid ? 'linux' : _platform.operatingSystem]; // Termux: map Android host to Linux artifacts\n"
+    cache_file = flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "flutter_cache.dart"
+    cache_source = cache_file.read_text()
+    cache_file.write_text(
+        cache_source.replace(
+            "final List<String>? binaryDirs = artifacts[_platform.operatingSystem];",
+            "final List<String>? binaryDirs = artifacts[_platform.isAndroid ? 'linux' : _platform.operatingSystem]; // Termux: map Android host to Linux artifacts",
+            1,
+        )
     )
     (flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "artifacts.dart").write_text("if (platform.isLinux || platform.isAndroid) {\n")
     (flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "build_info.dart").write_text("if (globals.platform.isLinux || globals.platform.isAndroid) {\n")

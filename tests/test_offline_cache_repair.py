@@ -88,7 +88,26 @@ def create_mock_env(tmp_path):
         flutter_root / "packages" / "flutter_tools" / "gradle" / "src" / "main" / "kotlin" / "FlutterPluginUtils.kt":
             "fun forceNdkDownload() {\n val forcingNotRequired: Boolean = true\n }\n",
         flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "flutter_cache.dart":
-            "final List<String>? binaryDirs = artifacts[_platform.operatingSystem];\n",
+            """final List<String>? binaryDirs = artifacts[_platform.operatingSystem];
+class AndroidGenSnapshotArtifacts extends EngineCachedArtifact {
+  @override
+  List<List<String>> getBinaryDirs() {
+    return <List<String>>[
+      if (cache.includeAllPlatforms) ...<List<String>>[
+        ..._osxBinaryDirs,
+        ..._linuxBinaryDirs,
+        ..._windowsBinaryDirs,
+        ..._dartSdks,
+      ] else if (_platform.isWindows)
+        ..._windowsBinaryDirs
+      else if (_platform.isMacOS)
+        ..._osxBinaryDirs
+      else if (_platform.isLinux)
+        ..._linuxBinaryDirs,
+    ];
+  }
+}
+""",
         flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "artifacts.dart":
             "if (platform.isLinux) {\n",
         flutter_root / "packages" / "flutter_tools" / "lib" / "src" / "build_info.dart":
