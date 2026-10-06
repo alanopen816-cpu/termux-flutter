@@ -356,11 +356,26 @@ patch_flutter_cache() {
     local font_legacy_single="final List<String>? binaryDirs = artifacts[_platform.isAndroid ? 'linux' : _platform.operatingSystem]; // Termux: map Android host to Linux artifacts"
     local font_legacy_single_period="${font_legacy_single}."
     local font_legacy_double="${font_postimage%.}"
+    local file_dir work_tmp result_tmp class_content
+    local host_declaration="    final bool termuxLinuxArm64Host = cache.getHostPlatformArchName() == 'linux-arm64';"
+    local dart_sdks_declaration="    final List<List<String>> termuxDartSdks = termuxLinuxArm64Host ? _dartSdks.where((sdk) => sdk.first != 'linux-x64').toList() : _dartSdks;"
+    local linux_spread="        if (!termuxLinuxArm64Host) ..._linuxBinaryDirs,"
+    local dart_sdk_spread="        ...termuxDartSdks,"
+    local linux_host_branch="      else if (_platform.isLinux && !termuxLinuxArm64Host)"
 
-    # Keep the existing font-subset adaptation independent of the Android snapshot
-    # correction so installations carrying only one patch can safely advance.
-    local font_tmp
-    font_tmp=$(mktemp "$TMPDIR/flutter_font_cache.XXXXXX")
+    file_dir=$(dirname "$file")
+    work_tmp=$(mktemp "$file_dir/.flutter_cache.XXXXXX") || return 1
+    result_tmp=$(mktemp "$file_dir/.flutter_cache_result.XXXXXX") || {
+        rm -f "$work_tmp"
+        return 1
+    }
+    if ! cp -p "$file" "$work_tmp"; then
+        rm -f "$work_tmp" "$result_tmp"
+        return 1
+    fi
+
+    # Stage both cache transformations in a same-directory copy. A failed or
+    # incomplete migration must never leave only the FontSubset edit behind.
     if ! awk -v pre="$font_preimage" -v post="$font_postimage" \
         -v legacy_single="$font_legacy_single" -v legacy_single_period="$font_legacy_single_period" \
         -v legacy_double="$font_legacy_double" '
@@ -379,51 +394,116 @@ patch_flutter_cache() {
         }
         { print }
         END { if (recognized != 1) exit 1 }
-    ' "$file" > "$font_tmp"; then
-        rm -f "$font_tmp"
+    ' "$work_tmp" > "$result_tmp"; then
+        echo "flutter_cache: unrecognized FontSubset cache selector" >&2
+        rm -f "$work_tmp" "$result_tmp"
         return 1
     fi
-    mv "$font_tmp" "$file"
-
-    if grep -F -q 'termuxLinuxArm64Host' "$file"; then
-        grep -F -q "cache.getHostPlatformArchName() == 'linux-arm64'" "$file" &&
-            grep -F -q 'if (!termuxLinuxArm64Host) ..._linuxBinaryDirs' "$file" &&
-            grep -F -q "sdk.first != 'linux-x64'" "$file" &&
-            grep -F -q '_platform.isLinux && !termuxLinuxArm64Host' "$file"
-        return $?
+    if ! cat "$result_tmp" > "$work_tmp"; then
+        rm -f "$work_tmp" "$result_tmp"
+        return 1
     fi
-    grep -F -q 'class AndroidGenSnapshotArtifacts extends EngineCachedArtifact {' "$file" || return 1
-    grep -F -q '..._linuxBinaryDirs,' "$file" || return 1
-    grep -F -q 'else if (_platform.isLinux)' "$file" || return 1
 
-    local transformed
-    transformed=$(mktemp "$TMPDIR/flutter_cache.XXXXXX")
-    awk '
+    if ! grep -F -q 'termuxLinuxArm64Host' "$work_tmp"; then
+        if ! awk -v host_declaration="$host_declaration" -v dart_sdks_declaration="$dart_sdks_declaration" \
+        -v linux_spread="$linux_spread" -v dart_sdk_spread="$dart_sdk_spread" \
+        -v linux_host_branch="$linux_host_branch" '
         /^class AndroidGenSnapshotArtifacts extends EngineCachedArtifact \{/ { in_class = 1 }
         in_class && /^  List<List<String>> getBinaryDirs\(\) \{$/ {
             print
-            print "    final bool termuxLinuxArm64Host = cache.getHostPlatformArchName() == '\''linux-arm64'\'';"
-            print "    final List<List<String>> termuxDartSdks = termuxLinuxArm64Host ? _dartSdks.where((sdk) => sdk.first != " sprintf("%c", 39) "linux-x64" sprintf("%c", 39) ").toList() : _dartSdks;"
+            print host_declaration
+            print dart_sdks_declaration
+            get_binary_dirs++
             next
         }
-        in_class && !linux_list_done && /^        \.\.\._linuxBinaryDirs,$/ {
-            print "        if (!termuxLinuxArm64Host) ..._linuxBinaryDirs,"
-            linux_list_done = 1
+        in_class && /^        \.\.\._linuxBinaryDirs,$/ {
+            linux_spread_count++
+            if (linux_spread_count == 1) print linux_spread
+            else print
             next
         }
         in_class && /^        \.\.\._dartSdks,$/ {
-            print "        ...termuxDartSdks,"
+            print dart_sdk_spread
+            dart_sdk_spread_count++
             next
         }
         in_class && /^      else if \(_platform\.isLinux\)$/ {
-            print "      else if (_platform.isLinux && !termuxLinuxArm64Host)"
+            print linux_host_branch
+            linux_host_branch_count++
             next
         }
-        in_class && /^\}$/ { in_class = 0 }
+        in_class && /^}$/ { in_class = 0; class_count++ }
         { print }
-    ' "$file" > "$transformed" && mv "$transformed" "$file"
-    grep -F -q 'if (!termuxLinuxArm64Host) ..._linuxBinaryDirs' "$file" &&
-        grep -F -q '_platform.isLinux && !termuxLinuxArm64Host' "$file"
+        END {
+            if (class_count != 1 || get_binary_dirs != 1 || linux_spread_count != 2 ||
+                dart_sdk_spread_count != 1 || linux_host_branch_count != 1 || in_class) exit 1
+        }
+    ' "$work_tmp" > "$result_tmp"; then
+            echo "flutter_cache: unsupported AndroidGenSnapshotArtifacts layout" >&2
+            rm -f "$work_tmp" "$result_tmp"
+            return 1
+        fi
+        if ! cat "$result_tmp" > "$work_tmp"; then
+            rm -f "$work_tmp" "$result_tmp"
+            return 1
+        fi
+    fi
+
+    class_content=$(awk '
+        /^class AndroidGenSnapshotArtifacts extends EngineCachedArtifact \{$/ {
+            if (inside_class) bad = 1
+            inside_class = 1
+            class_count++
+        }
+        inside_class { print }
+        inside_class && /^}$/ { inside_class = 0 }
+        END { if (class_count != 1 || inside_class || bad) exit 1 }
+    ' "$work_tmp") || {
+        echo "flutter_cache: AndroidGenSnapshotArtifacts class is missing or malformed" >&2
+        rm -f "$work_tmp" "$result_tmp"
+        return 1
+    }
+    local host_count dart_sdks_count linux_spread_count raw_linux_spread_count
+    local dart_sdk_spread_count linux_host_count direct_linux_spread_count
+    host_count=$(printf '%s\n' "$class_content" | grep -Fxc -- "$host_declaration" || true)
+    dart_sdks_count=$(printf '%s\n' "$class_content" | grep -Fxc -- "$dart_sdks_declaration" || true)
+    linux_spread_count=$(printf '%s\n' "$class_content" | grep -Fxc -- "$linux_spread" || true)
+    raw_linux_spread_count=$(printf '%s\n' "$class_content" | grep -Fxc -- '        ..._linuxBinaryDirs,' || true)
+    dart_sdk_spread_count=$(printf '%s\n' "$class_content" | grep -Fxc -- "$dart_sdk_spread" || true)
+    linux_host_count=$(printf '%s\n' "$class_content" | grep -Fxc -- "$linux_host_branch" || true)
+    direct_linux_spread_count=$(printf '%s\n' "$class_content" | awk \
+        -v branch="$linux_host_branch" \
+        -v raw_spread='        ..._linuxBinaryDirs,' \
+        -v gated_spread="$linux_spread" '
+        $0 == branch { pending = 1; next }
+        pending {
+            if ($0 == raw_spread || $0 == gated_spread) matched++
+            pending = 0
+        }
+        END { print matched + 0 }
+    ')
+    local linux_selection_valid=0
+    if { [ "$linux_spread_count" -eq 1 ] && [ "$raw_linux_spread_count" -eq 1 ] && \
+        [ "$direct_linux_spread_count" -eq 1 ]; } || \
+        { [ "$linux_spread_count" -eq 2 ] && [ "$raw_linux_spread_count" -eq 0 ] && \
+            [ "$direct_linux_spread_count" -eq 1 ]; }; then
+        linux_selection_valid=1
+    fi
+    if [ "$host_count" -ne 1 ] || [ "$dart_sdks_count" -ne 1 ] || \
+        [ "$linux_selection_valid" -ne 1 ] || [ "$dart_sdk_spread_count" -ne 1 ] || \
+        [ "$linux_host_count" -ne 1 ] || \
+        printf '%s\n' "$class_content" | grep -Fq '        ..._dartSdks,'; then
+        echo "flutter_cache: incomplete AndroidGenSnapshotArtifacts ARM64 selection" >&2
+        rm -f "$work_tmp" "$result_tmp"
+        return 1
+    fi
+
+    rm -f "$result_tmp"
+    if cmp -s "$file" "$work_tmp"; then
+        rm -f "$work_tmp"
+        return 0
+    fi
+    mv -f -- "$work_tmp" "$file"
 }
 register_patch "flutter_cache" "$FLUTTER_ROOT/packages/flutter_tools/lib/src/flutter_cache.dart" patch_flutter_cache
 
@@ -1374,24 +1454,37 @@ else
     echo "  ✓ VM snapshots present"
 fi
 
-# 12. Create linux-x64 -> linux-arm64 symlinks for host platform detection
-# Flutter's getCurrentHostPlatform() in build_info.dart doesn't recognize
-# Termux as Linux (Platform.operatingSystem returns 'android'), so it falls
-# back to HostPlatform.linux_x64, causing gen_snapshot lookup to search
-# linux-x64/ instead of linux-arm64/. Create symlinks to resolve this.
-echo "[12.5/13] Creating host platform symlinks..."
-ENG_ART=$FLUTTER_ROOT/bin/cache/artifacts/engine
-for dir in android-arm64-release android-arm64-profile; do
-    if [ -d "$ENG_ART/$dir/linux-arm64" ] && [ ! -e "$ENG_ART/$dir/linux-x64" ]; then
-        ln -sf linux-arm64 "$ENG_ART/$dir/linux-x64"
-        echo "  ✓ $dir/linux-x64 -> linux-arm64"
+# Remove only stale aliases that redirect linux-x64 Android snapshot downloads
+# into packaged ARM64 generators. Never remove real x64 directories or unrelated links.
+remove_stale_android_snapshot_aliases() {
+    local engine_artifacts="$1"
+    local directory alias packaged alias_target packaged_target
+    for directory in android-arm64-release android-arm64-profile; do
+        alias="$engine_artifacts/$directory/linux-x64"
+        packaged="$engine_artifacts/$directory/linux-arm64"
+        if [ -L "$alias" ] && [ -d "$packaged" ]; then
+            alias_target=$(readlink -f "$alias" 2>/dev/null || true)
+            packaged_target=$(readlink -f "$packaged" 2>/dev/null || true)
+            if [ -n "$alias_target" ] && [ "$alias_target" = "$packaged_target" ]; then
+                rm -f -- "$alias"
+                echo "  ✓ Removed stale Android snapshot alias: $directory/linux-x64"
+            fi
+        fi
+    done
+    alias="$engine_artifacts/linux-x64"
+    packaged="$engine_artifacts/linux-arm64"
+    if [ -L "$alias" ] && [ -d "$packaged" ]; then
+        alias_target=$(readlink -f "$alias" 2>/dev/null || true)
+        packaged_target=$(readlink -f "$packaged" 2>/dev/null || true)
+        if [ -n "$alias_target" ] && [ "$alias_target" = "$packaged_target" ]; then
+            rm -f -- "$alias"
+            echo "  ✓ Removed stale host artifact alias: linux-x64"
+        fi
     fi
-done
-# Also create top-level linux-x64 -> linux-arm64 symlink for general artifacts
-if [ -d "$ENG_ART/linux-arm64" ] && [ ! -e "$ENG_ART/linux-x64" ]; then
-    ln -sf linux-arm64 "$ENG_ART/linux-x64"
-    echo "  ✓ linux-x64 -> linux-arm64"
-fi
+}
+echo "[12.5/13] Removing stale Android snapshot aliases..."
+ENG_ART=$FLUTTER_ROOT/bin/cache/artifacts/engine
+remove_stale_android_snapshot_aliases "$ENG_ART"
 
 # 12.7c. Create api-level.h for CMake system detection
 # CMake's CMakeDetermineSystem.cmake reads $PREFIX/include/android/api-level.h
