@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +26,8 @@ FLUTTER_VERSION = "3.47.2"
 PACKAGE_VERSION = "3.47.2-1"
 PREFIX_RELATIVE = Path("data/data/com.termux/files/usr")
 FLUTTER_RELATIVE = PREFIX_RELATIVE / "opt/flutter"
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
 PUBLISHED_RESOURCES = (
     "flutter",
     "flutter_tools_git",
@@ -675,6 +680,63 @@ def _validate_scratch_locations(temporary_root: Path, output: Path, repo_root: P
         raise RepackError("output must remain inside this repository's install-ready artifacts") from exc
 
 
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename within one filesystem without replacing any destination type."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (AttributeError, OSError) as exc:
+        raise RepackError("atomic no-overwrite publication requires libc renameat2") from exc
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+                          ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = renameat2(AT_FDCWD, os.fsencode(source), AT_FDCWD,
+                       os.fsencode(destination), RENAME_NOREPLACE)
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), str(destination))
+    if error in (errno.ENOSYS, errno.EINVAL, getattr(errno, "EOPNOTSUPP", errno.ENOSYS)):
+        raise RepackError("atomic no-overwrite publication is unsupported by this kernel/filesystem")
+    raise OSError(error, os.strerror(error), str(destination))
+
+
+def preflight_atomic_publisher(directory: Path) -> None:
+    """Prove renameat2 no-replace behavior on the destination filesystem before build work."""
+    directory = Path(directory)
+    try:
+        with tempfile.TemporaryDirectory(prefix=".flutter-publish-probe-", dir=directory) as name:
+            root = Path(name)
+            source, destination = root / "candidate", root / "published"
+            source.write_bytes(b"atomic publisher preflight\n")
+            source.chmod(0o640)
+            _rename_noreplace(source, destination)
+            if (source.exists() or destination.read_bytes() != b"atomic publisher preflight\n"
+                    or stat.S_IMODE(destination.stat().st_mode) != 0o640):
+                raise RepackError("atomic no-overwrite publisher failed its same-filesystem probe")
+            contender = root / "contender"
+            contender.write_bytes(b"must not replace existing destination")
+            try:
+                _rename_noreplace(contender, destination)
+            except FileExistsError:
+                pass
+            else:
+                raise RepackError("atomic publisher replaced an existing destination")
+            if (not contender.is_file() or destination.read_bytes() != b"atomic publisher preflight\n"):
+                raise RepackError("atomic publisher changed files during collision preflight")
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except RepackError:
+        raise
+    except (OSError, AttributeError) as exc:
+        raise RepackError(f"atomic no-overwrite publisher preflight failed: {exc}") from exc
+
+
 def publish_verified(candidate: Path, output: Path, validator) -> None:
     """Validate first, then create a no-overwrite atomic publication on output's filesystem."""
     candidate, output = Path(candidate), Path(output)
@@ -687,10 +749,10 @@ def publish_verified(candidate: Path, output: Path, validator) -> None:
     try:
         with os.fdopen(fd, "wb") as target, candidate.open("rb") as source:
             shutil.copyfileobj(source, target, 1024 * 1024)
+            os.fchmod(target.fileno(), stat.S_IMODE(candidate.stat().st_mode))
             target.flush()
             os.fsync(target.fileno())
-        os.link(temporary, output)
-        temporary.unlink()
+        _rename_noreplace(temporary, output)
         directory_fd = os.open(output.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
@@ -718,6 +780,7 @@ def repack(source: Path, output: Path, *, engine_stamp_json: Path | None = None,
     _validate_scratch_locations(temporary_root, output, repo_root)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_root.mkdir(parents=True, exist_ok=True)
+    preflight_atomic_publisher(output.parent)
     with tempfile.TemporaryDirectory(prefix="flutter-verified-repack-", dir=temporary_root) as temp_name:
         temporary = Path(temp_name)
         payload, control = temporary / "payload", temporary / "control"

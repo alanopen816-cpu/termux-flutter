@@ -1,8 +1,11 @@
 import hashlib
 import importlib.util
 import json
+import errno
+import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -326,6 +329,119 @@ def test_invalid_final_build_is_never_published(tmp_path):
         repack.publish_verified(staged, output, lambda _path: (_ for _ in ()).throw(
             RuntimeError("compile/load failed")))
     assert not output.exists()
+
+
+def test_verified_publication_atomically_preserves_candidate_bytes_and_mode(tmp_path):
+    candidate = tmp_path / "candidate.deb"
+    output = tmp_path / "published.deb"
+    candidate.write_bytes(b"complete validated package")
+    candidate.chmod(0o640)
+    validated = []
+
+    repack.publish_verified(candidate, output, lambda path: validated.append(path.read_bytes()))
+
+    assert validated == [candidate.read_bytes()]
+    assert output.read_bytes() == candidate.read_bytes()
+    assert output.stat().st_mode & 0o777 == 0o640
+    assert not list(tmp_path.glob(".published.deb.*.pending"))
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
+def test_verified_publication_never_overwrites_existing_path(tmp_path, kind):
+    candidate = tmp_path / "candidate.deb"
+    output = tmp_path / "published.deb"
+    candidate.write_bytes(b"new")
+    if kind == "file":
+        output.write_bytes(b"keep")
+    elif kind == "directory":
+        output.mkdir()
+    else:
+        target = tmp_path / "symlink-target"
+        target.write_bytes(b"keep")
+        output.symlink_to(target)
+
+    with pytest.raises(repack.RepackError, match="already exists"):
+        repack.publish_verified(candidate, output, lambda _path: None)
+
+    if kind == "file":
+        assert output.read_bytes() == b"keep"
+    elif kind == "directory":
+        assert output.is_dir()
+    else:
+        assert output.is_symlink() and output.read_bytes() == b"keep"
+
+
+def test_rename_noreplace_wins_one_concurrent_publication_race(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    target = tmp_path / "target"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    barrier = threading.Barrier(3)
+    results = []
+
+    def rename(source):
+        barrier.wait()
+        try:
+            repack._rename_noreplace(source, target)
+            results.append((source, 0))
+        except FileExistsError as exc:
+            results.append((source, exc.errno))
+
+    threads = [threading.Thread(target=rename, args=(source,)) for source in (first, second)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sum(status == 0 for _, status in results) == 1
+    assert sum(status == errno.EEXIST for _, status in results) == 1
+    assert target.read_bytes() in (b"first", b"second")
+    loser = first if first.exists() else second
+    assert loser.exists()
+
+
+@pytest.mark.parametrize("kind", ["file", "directory", "symlink"])
+def test_rename_noreplace_rejects_existing_filesystem_object(tmp_path, kind):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.write_bytes(b"new candidate")
+    if kind == "file":
+        destination.write_bytes(b"keep existing")
+    elif kind == "directory":
+        destination.mkdir()
+    else:
+        target = tmp_path / "target"
+        target.write_bytes(b"keep existing")
+        destination.symlink_to(target)
+
+    with pytest.raises(FileExistsError) as error:
+        repack._rename_noreplace(source, destination)
+
+    assert error.value.errno == errno.EEXIST
+    assert source.read_bytes() == b"new candidate"
+    if kind == "file":
+        assert destination.read_bytes() == b"keep existing"
+    elif kind == "directory":
+        assert destination.is_dir()
+    else:
+        assert destination.is_symlink() and destination.read_bytes() == b"keep existing"
+
+
+def test_atomic_publisher_preflight_and_unsupported_primitive_cleanup(tmp_path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    repack.preflight_atomic_publisher(scratch)
+    assert list(scratch.iterdir()) == []
+
+    candidate = tmp_path / "candidate.deb"
+    candidate.write_bytes(b"candidate")
+    output = tmp_path / "published.deb"
+    monkeypatch.setattr(repack, "_rename_noreplace", lambda *_args: (_ for _ in ()).throw(
+        repack.RepackError("renameat2 unavailable")))
+    with pytest.raises(repack.RepackError, match="renameat2 unavailable"):
+        repack.publish_verified(candidate, output, lambda _path: None)
+    assert not output.exists()
+    assert not list(tmp_path.glob(".published.deb.*.pending"))
 
 
 def test_repack_compile_failure_leaves_requested_output_absent(tmp_path, monkeypatch):

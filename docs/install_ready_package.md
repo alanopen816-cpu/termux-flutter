@@ -50,7 +50,12 @@ extracted SDK, then strictly rejects any missing or escaping root. It runs the c
 synthetic Git metadata for the launcher's `HEAD:FLUTTER_TOOL_ARGS` key, then uses the
 archived native Dart compiler to build and load a new kernel snapshot. It uses a
 private HOME/Pub cache/temp root and validates the candidate package plus every ELF
-byte hash before publishing the output without overwriting an existing file. Current
+byte hash before publication. Before compilation, it probes Linux `renameat2` with
+`RENAME_NOREPLACE` on the output filesystem; this keeps publication atomic without
+depending on Python's optional `os.link` API or a racy exists-then-replace sequence.
+If the kernel/filesystem lacks that primitive, the repack fails before expensive work.
+The final copy preserves candidate bytes and mode, and an existing file, directory,
+or symlink is never replaced. Current
 package.yaml resources, wrappers, profile, postinst and configuration helpers are
 applied. Since the general package walker intentionally skips directories named
 `engine`, the repacker explicitly maps the archived `bin/cache/artifacts/engine`
