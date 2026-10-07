@@ -101,6 +101,10 @@ def test_bootstrap_validates_isolated_snapshot_before_android_configuration(tmp_
     prefix, root, sdk, home = _package_fixture(tmp_path)
     loads = _mock_native_loader(monkeypatch)
     calls = []
+    caller_tmp = tmp_path / "caller-tmp"
+    caller_tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(caller_tmp))
+    monkeypatch.setattr(bootstrap.tempfile, "tempdir", None)
     monkeypatch.setattr(bootstrap._android_config, "is_termux_runtime", lambda _prefix: True)
     monkeypatch.setattr(bootstrap, "configure_android", lambda *args: calls.append(args) or True)
     bootstrap.configure_package(prefix, home, root, sdk, tool_args="")
@@ -109,7 +113,7 @@ def test_bootstrap_validates_isolated_snapshot_before_android_configuration(tmp_
     loaded_snapshot = Path(loads[0][0][-4])
     assert root not in loaded_snapshot.parents
     assert "flutter-package-check-" in str(loaded_snapshot)
-    assert loads[0][1]["env"]["HOME"].startswith("/data/data/com.termux/files/usr/tmp/flutter-package-check-")
+    assert loads[0][1]["env"]["HOME"].startswith(str(caller_tmp / "flutter-package-check-"))
 
 
 def test_bootstrap_repeat_preserves_configured_files(tmp_path, monkeypatch):

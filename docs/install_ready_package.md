@@ -25,3 +25,40 @@ Git/stamp identity, inconsistent engine markers, and absent/non-executable `post
 This validates archive structure and provenance; it is not a clean-device install or
 Android debug/release build acceptance result. A verified-payload repack and final
 extracted-package launcher/device acceptance remain separate release checks.
+
+## Verified local repack (not a fresh engine build)
+
+When cross-build inputs are unavailable, the explicitly named repack utility can
+rebuild the package around the pinned CI ARM64 payload. It accepts only
+`flutter_3.47.2_aarch64.deb` with SHA-256
+`f3236fdc40cf85712aacea5ccb8d55611f76d6380c12f19276566f27db22188c`; it never
+downloads sources or changes the installed SDK. Example on native Termux:
+
+```sh
+python scripts/package/repack_verified_payload.py \
+  --source "$HOME/termux-flutter/flutter-termux-3.47.2-arm64/flutter_3.47.2_aarch64.deb" \
+  --engine-stamp-json "$PREFIX/opt/flutter/bin/cache/engine_stamp.json" \
+  --output artifacts/install-ready/flutter_3.47.2_aarch64.deb
+```
+
+The matching engine metadata is read-only input and must name the exact engine
+revision in archived `bin/internal/engine.version`; a missing or mismatched file is
+an error, not a fallback. The pinned archive carries absolute CI paths for its cached
+pub packages. The utility accepts them only as one consistent `flutter/.pub-cache`
+source prefix anchored by the `flutter_tools` package entry, rebases them into the
+extracted SDK, then strictly rejects any missing or escaping root. It runs the current mandatory source patches there, creates marked minimal
+synthetic Git metadata for the launcher's `HEAD:FLUTTER_TOOL_ARGS` key, then uses the
+archived native Dart compiler to build and load a new kernel snapshot. It uses a
+private HOME/Pub cache/temp root and validates the candidate package plus every ELF
+byte hash before publishing the output without overwriting an existing file. Current
+package.yaml resources, wrappers, profile, postinst and configuration helpers are
+applied. The provenance file records the input archive, workspace commit, reused
+engine revision, Dart compiler, generated kernel hash, synthetic commit, and ELF
+inventory.
+
+This is deliberately **not** described as a fresh Flutter/engine GN build: engine
+ELFs and Android generators remain byte-identical payloads from the pinned CI
+archive. The minimal synthetic Git commit is a package compile key, not upstream
+Flutter history. The Android SDK remains a separate pre-existing Termux prerequisite;
+the repack does not bundle or install it. Repack validation is not a clean package
+install or new-project debug/release acceptance.
