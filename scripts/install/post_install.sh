@@ -373,7 +373,8 @@ patch_flutter_cache() {
     local font_legacy_single_period="${font_legacy_single}."
     local font_legacy_double="${font_postimage%.}"
     local file_dir work_tmp result_tmp class_content
-    local host_declaration="    final bool termuxLinuxArm64Host = cache.getHostPlatformArchName() == 'linux-arm64';"
+    local host_declaration="    final bool termuxLinuxArm64Host = _platform.isLinux && _platform.environment.containsKey('TERMUX_VERSION') && cache.getHostPlatformArchName() == 'arm64';"
+    local legacy_host_declaration="    final bool termuxLinuxArm64Host = cache.getHostPlatformArchName() == 'linux-arm64';"
     local dart_sdks_declaration="    final List<List<String>> termuxDartSdks = termuxLinuxArm64Host ? _dartSdks.where((sdk) => sdk.first != 'linux-x64').toList() : _dartSdks;"
     local linux_spread="        if (!termuxLinuxArm64Host) ..._linuxBinaryDirs,"
     local dart_sdk_spread="        ...termuxDartSdks,"
@@ -418,6 +419,24 @@ patch_flutter_cache() {
     if ! cat "$result_tmp" > "$work_tmp"; then
         rm -f "$work_tmp" "$result_tmp"
         return 1
+    fi
+
+    # Migrate the known prior postimage: getHostPlatformArchName returns the
+    # HostPlatform.platformName ('arm64'), not the CLI name ('linux-arm64').
+    if grep -Fqx -- "$legacy_host_declaration" "$work_tmp"; then
+        if ! awk -v old="$legacy_host_declaration" -v new="$host_declaration" '
+            $0 == old { print new; replaced++; next }
+            { print }
+            END { if (replaced != 1) exit 1 }
+        ' "$work_tmp" > "$result_tmp"; then
+            echo "flutter_cache: ambiguous legacy ARM64 host guard" >&2
+            rm -f "$work_tmp" "$result_tmp"
+            return 1
+        fi
+        if ! cat "$result_tmp" > "$work_tmp"; then
+            rm -f "$work_tmp" "$result_tmp"
+            return 1
+        fi
     fi
 
     if ! grep -F -q 'termuxLinuxArm64Host' "$work_tmp"; then
@@ -632,6 +651,94 @@ patch_icon_tree_shaker() {
     sed -i "s|_environment.defines\[kIconTreeShakerFlag\] == 'true'|false /* Termux: const_finder unavailable */|g" "$1"
 }
 register_patch "icon_tree_shaker" "$FLUTTER_ROOT/packages/flutter_tools/lib/src/build_system/targets/icon_tree_shaker.dart" patch_icon_tree_shaker
+
+patch_gradle_wrapper() {
+    python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+original = path.read_bytes()
+try:
+    source = original.decode("utf-8")
+except UnicodeDecodeError as error:
+    raise SystemExit(f"gradle_wrapper: source is not UTF-8: {error}")
+marker = "void _termuxNormalizeGradleWrapper(File file, Platform platform) {"
+call = "        _termuxNormalizeGradleWrapper(dest, _platform);\n"
+if marker in source:
+    if source.count(marker) != 1 or source.count(call) != 1:
+        raise SystemExit("gradle_wrapper: incomplete or ambiguous existing patch")
+    raise SystemExit(0)
+helper = '''void _termuxNormalizeGradleWrapper(File file, Platform platform) {
+  if (!platform.isLinux || !platform.environment.containsKey('TERMUX_VERSION')) {
+    return;
+  }
+  if (!file.path.endsWith('/gradlew')) {
+    return;
+  }
+  const String defaultShebang = '#!/usr/bin/env bash';
+  final String contents = file.readAsStringSync();
+  if (!contents.startsWith(defaultShebang)) {
+    return;
+  }
+  if (contents.length == defaultShebang.length ||
+      (contents[defaultShebang.length] != '\\n' && contents[defaultShebang.length] != '\\r')) {
+    throw StateError('Malformed default Gradle wrapper shebang in ${file.path}.');
+  }
+  final String? prefix = platform.environment['PREFIX'];
+  if (prefix == null || !prefix.startsWith('/') || prefix.contains('\\n') || prefix.contains('\\r')) {
+    throw StateError('A valid absolute PREFIX is required to configure the Termux Gradle wrapper.');
+  }
+  final String normalizedPrefix = prefix.endsWith('/') ? prefix.substring(0, prefix.length - 1) : prefix;
+  final String updated = '#!$normalizedPrefix/bin/bash${contents.substring(defaultShebang.length)}';
+  final Directory temporaryDirectory = file.parent.createTempSync('.termux-gradlew-');
+  try {
+    final String fileName = file.path.split('/').last;
+    final File temporary = temporaryDirectory.childFile(fileName);
+    temporary.writeAsStringSync(updated, flush: true);
+    temporary.renameSync(file.path);
+  } on Object {
+    if (temporaryDirectory.existsSync()) {
+      temporaryDirectory.deleteSync(recursive: true);
+    }
+    rethrow;
+  }
+  try {
+    if (temporaryDirectory.existsSync()) {
+      temporaryDirectory.deleteSync(recursive: true);
+    }
+  } on Object {
+    // The shebang has already been atomically published; temp cleanup is best effort.
+  }
+}
+
+'''
+class_marker = "class GradleUtils {"
+copy_marker = "        _operatingSystemUtils.makeExecutable(dest);\n"
+if source.count(class_marker) != 1 or source.count(copy_marker) != 1:
+    raise SystemExit("gradle_wrapper: unsupported GradleUtils source layout")
+patched = source.replace(class_marker, helper + class_marker, 1)
+patched = patched.replace(copy_marker, call + copy_marker, 1)
+fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(patched.encode("utf-8"))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary_name, stat.S_IMODE(path.stat().st_mode))
+    os.replace(temporary_name, path)
+except BaseException:
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+register_patch "gradle_wrapper" "$FLUTTER_ROOT/packages/flutter_tools/lib/src/android/gradle_utils.dart" patch_gradle_wrapper
 
 patch_cmake_lists() {
     if grep -F -q "FlutterNDKTrick" "$1"; then return 0; fi

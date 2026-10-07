@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 FLUTTER_VERSION = "3.47.2"
-PACKAGE_VERSION = "3.47.2-1"
+PACKAGE_VERSION = "3.47.2-2"
 PREFIX_RELATIVE = Path("data/data/com.termux/files/usr")
 FLUTTER_RELATIVE = PREFIX_RELATIVE / "opt/flutter"
 AT_FDCWD = -100
@@ -42,6 +42,7 @@ PUBLISHED_RESOURCES = (
 )
 PATCH_FUNCTIONS = (
     ("patch_flutter_cache", "packages/flutter_tools/lib/src/flutter_cache.dart"),
+    ("patch_gradle_wrapper", "packages/flutter_tools/lib/src/android/gradle_utils.dart"),
     ("patch_compile_sdk", "packages/flutter_tools/gradle/src/main/kotlin/FlutterExtension.kt"),
     ("patch_plugin_utils", "packages/flutter_tools/gradle/src/main/kotlin/FlutterPluginUtils.kt"),
     ("patch_shebang_flutter", "bin/flutter"),
@@ -354,7 +355,7 @@ def _package_object(root: Path, repo_root: Path, package_yaml: dict):
         resource=resources,
         define=package_yaml.get("define"),
         tag=FLUTTER_VERSION,
-        revision="1",
+        revision="2",
         maintainer_scripts={"postinst": repo_root / "scripts/install/postinst.sh"},
     )
 
@@ -877,7 +878,7 @@ def repack(source: Path, output: Path, *, engine_stamp_json: Path | None = None,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path.home() / "termux-flutter/flutter-termux-3.47.2-arm64/flutter_3.47.2_aarch64.deb")
-    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[2] / "artifacts/install-ready/flutter_3.47.2_aarch64.deb")
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[2] / "artifacts/install-ready-r2/flutter_3.47.2_aarch64.deb")
     parser.add_argument("--engine-stamp-json", type=Path, help="read-only engine metadata whose revision must match the archived engine.version")
     parser.add_argument("--tool-args", default=None, help="FlutterTools compile key arguments; defaults to FLUTTER_TOOL_ARGS or empty")
     args = parser.parse_args(argv)

@@ -12,7 +12,6 @@ from test_offline_cache_repair import create_mock_env, run_post_install
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 POST_INSTALL = REPO_ROOT / "scripts/install/post_install.sh"
-ENGINE_PATCH = REPO_ROOT / "patches/3.47.2/flutter_sdk_arm64_default.patch"
 
 
 def _synthetic_elf(machine, interpreter, marker):
@@ -75,14 +74,14 @@ def _run_flutter_cache_patch(target, flutter_root, android_sdk, prefix):
 
 def test_android_snapshot_cache_skips_linux_x64_bundles_on_arm64_host():
     source = POST_INSTALL.read_text()
-    patch = ENGINE_PATCH.read_text()
     assert "termuxLinuxArm64Host" in source
     assert "cache.getHostPlatformArchName()" in source
-    assert "cache.getHostPlatformArchName() == 'linux-arm64'" in patch
-    assert "if (!termuxLinuxArm64Host) ..._linuxBinaryDirs" in patch
-    assert "sdk.first != 'linux-x64'" in patch
-    assert "...termuxDartSdks" in patch
-    assert "_platform.isLinux && !termuxLinuxArm64Host" in patch
+    assert "_platform.environment.containsKey('TERMUX_VERSION')" in source
+    assert "cache.getHostPlatformArchName() == 'arm64'" in source
+    assert "if (!termuxLinuxArm64Host) ..._linuxBinaryDirs" in source
+    assert "sdk.first != 'linux-x64'" in source
+    assert "...termuxDartSdks" in source
+    assert "_platform.isLinux && !termuxLinuxArm64Host" in source
 
 
 def test_post_install_does_not_alias_linux_x64_to_packaged_arm64():
@@ -139,7 +138,8 @@ def test_post_install_patches_old_font_cache_and_new_snapshot_selection(
     assert "patch updated, re-applying" in result.stdout
     patched = cache_file.read_text()
     assert indent + expected_font_line in patched
-    assert "cache.getHostPlatformArchName() == 'linux-arm64'" in patched
+    assert "_platform.environment.containsKey('TERMUX_VERSION')" in patched
+    assert "cache.getHostPlatformArchName() == 'arm64'" in patched
     assert "if (!termuxLinuxArm64Host) ..._linuxBinaryDirs" in patched
     assert "_platform.isLinux && !termuxLinuxArm64Host" in patched
     assert "sdk.first != 'linux-x64'" in patched
@@ -195,7 +195,8 @@ def test_flutter_cache_patch_preserves_mode_after_success(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert cache_file.stat().st_mode & 0o777 == 0o640
     patched = cache_file.read_text()
-    assert "cache.getHostPlatformArchName() == 'linux-arm64'" in patched
+    assert "_platform.environment.containsKey('TERMUX_VERSION')" in patched
+    assert "cache.getHostPlatformArchName() == 'arm64'" in patched
     assert "if (!termuxLinuxArm64Host) ..._linuxBinaryDirs" in patched
     assert "sdk.first != 'linux-x64'" in patched
     assert "...termuxDartSdks" in patched
@@ -243,9 +244,11 @@ def test_flutter_cache_patch_accepts_legacy_guarded_linux_selection(tmp_path, gu
     result = _run_flutter_cache_patch(cache_file, flutter_root, android_sdk, prefix)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert hashlib.sha256(cache_file.read_bytes()).hexdigest() == original_hash
+    assert hashlib.sha256(cache_file.read_bytes()).hexdigest() != original_hash
     assert cache_file.stat().st_mode & 0o777 == 0o600
     patched = cache_file.read_text()
+    assert "_platform.environment.containsKey('TERMUX_VERSION')" in patched
+    assert "cache.getHostPlatformArchName() == 'arm64'" in patched
     assert patched.count("if (!termuxLinuxArm64Host) ..._linuxBinaryDirs") == 1 + guard_direct_spread
     expected_linux_spread = (
         "if (!termuxLinuxArm64Host) ..._linuxBinaryDirs,"
@@ -359,12 +362,19 @@ const _dartSdks = <List<String>>[
 class Cache {
   Cache(this.includeAllPlatforms, this.host);
   final bool includeAllPlatforms;
-  final String host;
-  String getHostPlatformArchName() => host;
+  final HostPlatform host;
+  String getHostPlatformArchName() => host.platformName;
+}
+class HostPlatform {
+  const HostPlatform(this.cliName, this.platformName);
+  final String cliName;
+  final String platformName;
 }
 class Platform {
-  Platform({this.isWindows = false, this.isMacOS = false, this.isLinux = false});
+  Platform({this.isWindows = false, this.isMacOS = false, this.isLinux = false, this.isTermux = false});
   final bool isWindows, isMacOS, isLinux;
+  final bool isTermux;
+  Map<String, String> get environment => isTermux ? {'TERMUX_VERSION': 'test'} : <String, String>{};
 }
 class AndroidGenSnapshotArtifacts {
   AndroidGenSnapshotArtifacts(this.cache, this._platform);
@@ -376,16 +386,20 @@ class AndroidGenSnapshotArtifacts {
 }
 void check(bool value, String message) { if (!value) throw StateError(message); }
 void main() {
-  final armAll = AndroidGenSnapshotArtifacts(Cache(true, 'linux-arm64'), Platform(isLinux: true)).getBinaryDirs();
+  const arm64 = HostPlatform('linux-arm64', 'arm64');
+  const x64 = HostPlatform('linux-x64', 'x64');
+  final armAll = AndroidGenSnapshotArtifacts(Cache(true, arm64), Platform(isLinux: true, isTermux: true)).getBinaryDirs();
   check(!armAll.any((entry) => entry.first == 'linux-host'), 'ARM64 includeAll selected Linux host binaries');
   check(!armAll.any((entry) => entry.first == 'linux-x64'), 'ARM64 includeAll selected x64 Dart SDK');
   check(armAll.any((entry) => entry.first == 'darwin-host'), 'includeAll lost Darwin bundles');
   check(armAll.any((entry) => entry.first == 'windows-host'), 'includeAll lost Windows bundles');
-  final armLinux = AndroidGenSnapshotArtifacts(Cache(false, 'linux-arm64'), Platform(isLinux: true)).getBinaryDirs();
+  final armLinux = AndroidGenSnapshotArtifacts(Cache(false, arm64), Platform(isLinux: true, isTermux: true)).getBinaryDirs();
   check(armLinux.isEmpty, 'ARM64 direct Linux selected incompatible bundles');
-  final x64Linux = AndroidGenSnapshotArtifacts(Cache(false, 'linux-x64'), Platform(isLinux: true)).getBinaryDirs();
+  final desktopArm64 = AndroidGenSnapshotArtifacts(Cache(false, arm64), Platform(isLinux: true)).getBinaryDirs();
+  check(desktopArm64.any((entry) => entry.first == 'linux-host'), 'non-Termux ARM64 Linux behavior changed');
+  final x64Linux = AndroidGenSnapshotArtifacts(Cache(false, x64), Platform(isLinux: true)).getBinaryDirs();
   check(x64Linux.any((entry) => entry.first == 'linux-host'), 'Linux x64 behavior changed');
-  final windows = AndroidGenSnapshotArtifacts(Cache(false, 'windows-x64'), Platform(isWindows: true)).getBinaryDirs();
+  final windows = AndroidGenSnapshotArtifacts(Cache(false, const HostPlatform('windows-x64', 'x64')), Platform(isWindows: true)).getBinaryDirs();
   check(windows.any((entry) => entry.first == 'windows-host'), 'Windows behavior changed');
   print('patched Android snapshot selection: PASS');
 }

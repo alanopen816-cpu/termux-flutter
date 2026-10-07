@@ -38,8 +38,14 @@ downloads sources or changes the installed SDK. Example on native Termux:
 python scripts/package/repack_verified_payload.py \
   --source "$HOME/termux-flutter/flutter-termux-3.47.2-arm64/flutter_3.47.2_aarch64.deb" \
   --engine-stamp-json "$PREFIX/opt/flutter/bin/cache/engine_stamp.json" \
-  --output artifacts/install-ready/flutter_3.47.2_aarch64.deb
+  --output artifacts/install-ready-r2/flutter_3.47.2_aarch64.deb
 ```
+
+The next candidate is Debian package revision `3.47.2-2`; the Flutter release remains
+`3.47.2`. The earlier `3.47.2-1` candidate is blocked and is not overwritten. This
+revision corrects the ARM64 cache selector using Flutter's `HostPlatform.platformName`
+API and normalizes only newly copied default Gradle wrappers to Termux's native Bash.
+Existing project wrappers and custom shebangs remain untouched.
 
 The matching engine metadata is read-only input and must name the exact engine
 revision in archived `bin/internal/engine.version`; a missing or mismatched file is
