@@ -161,6 +161,49 @@ def test_native_inventory_comparison_requires_identical_bytes(tmp_path):
         repack.assert_native_inventory_equal(before, after)
 
 
+def test_repack_resources_preserve_full_engine_cache_native_inventory(tmp_path):
+    import yaml
+
+    root = tmp_path / "flutter"
+    (root / "bin/internal").mkdir(parents=True)
+    (root / "bin/internal/engine.version").write_text("a" * 40)
+    (root / "bin/version").write_text("3.47.2\n")
+    cache = root / "bin/cache/artifacts/engine"
+    release = cache / "android-arm64-release/linux-arm64/gen_snapshot"
+    profile = cache / "android-arm64-profile/linux-arm64/gen_snapshot"
+    companion = cache / "android-arm64-release/linux-arm64/libpayload.so"
+    for path, contents in ((release, b"\x7fELFrelease"), (profile, b"\x7fELFprofile"),
+                           (companion, b"\x7fELFengine-library")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+        path.chmod(0o755)
+    extra = root / "bin/cache/dart-sdk/bin/dart"
+    extra.parent.mkdir(parents=True)
+    extra.write_bytes(b"\x7fELFdart-runtime")
+    (root / "bin/cache/flutter_tools_git").mkdir(parents=True)
+    (root / "bin/cache/flutter_tools_git/termux_synthetic").write_text("fixture\n")
+
+    package_yaml = yaml.safe_load((repack.REPO_ROOT / "package.yaml").read_text(encoding="utf-8"))
+    package = repack._package_object(root, repack.REPO_ROOT, package_yaml)
+
+    class GenericTreeOnly:
+        def gen_resource(self, _names):
+            yield from package.gen_resource("flutter")
+
+    with pytest.raises(repack.RepackError, match="do not preserve staged native ELF inventory"):
+        repack.validate_package_native_inventory(GenericTreeOnly(), root)
+
+    resources = list(package.gen_resource(list(repack.PUBLISHED_RESOURCES)))
+    outputs = {Path(item["out"]) for item in resources}
+    expected_outputs = {
+        repack.FLUTTER_RELATIVE / release.relative_to(root),
+        repack.FLUTTER_RELATIVE / profile.relative_to(root),
+        repack.FLUTTER_RELATIVE / companion.relative_to(root),
+    }
+    assert expected_outputs <= outputs, "resource filtering dropped cached release/profile engine payload"
+    assert repack.validate_package_native_inventory(package, root) == repack.native_inventory(root)
+
+
 def test_resource_overlay_targets_payload_root_not_working_directory(tmp_path):
     payload = tmp_path / "payload"
     sdk = payload / repack.FLUTTER_RELATIVE

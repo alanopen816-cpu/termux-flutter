@@ -33,6 +33,7 @@ PUBLISHED_RESOURCES = (
     "post_install",
     "configure_android",
     "flutter_package_bootstrap",
+    "verified_engine_cache",
 )
 PATCH_FUNCTIONS = (
     ("patch_flutter_cache", "packages/flutter_tools/lib/src/flutter_cache.dart"),
@@ -325,12 +326,22 @@ def _synthetic_git(root: Path, *, private: Path) -> str:
 def _package_object(root: Path, repo_root: Path, package_yaml: dict):
     import package as package_builder
 
-    resources = {name: package_yaml["resource"][name] for name in PUBLISHED_RESOURCES}
+    resources = {name: package_yaml["resource"][name] for name in PUBLISHED_RESOURCES
+                 if name in package_yaml["resource"]}
     # These checked-in scripts are normally adjacent to the checkout's Flutter source.
     # Rebind only their current package.yaml resource entries to this checkout.
     resources["post_install"] = dict(resources["post_install"], source=str(repo_root / "scripts/install/post_install.sh"))
     resources["configure_android"] = dict(resources["configure_android"], source=str(repo_root / "scripts/install/configure_android.py"))
     resources["flutter_package_bootstrap"] = dict(resources["flutter_package_bootstrap"], source=str(repo_root / "scripts/install/flutter_package_bootstrap.py"))
+    engine_cache = Path(root) / "bin/cache/artifacts/engine"
+    if engine_cache.is_symlink() or not engine_cache.is_dir():
+        raise RepackError(f"verified archive is missing its runtime engine cache tree: {engine_cache}")
+    # package.py's generic source-tree walker intentionally excludes directories named
+    # "engine"; map only the existing runtime cache subtree back into its fixed SDK path.
+    resources["verified_engine_cache"] = {
+        "source": str(engine_cache),
+        "output": str(FLUTTER_RELATIVE / "bin/cache/artifacts/engine"),
+    }
     return package_builder.Package(
         root=root,
         arch="arm64",
@@ -341,6 +352,50 @@ def _package_object(root: Path, repo_root: Path, package_yaml: dict):
         revision="1",
         maintainer_scripts={"postinst": repo_root / "scripts/install/postinst.sh"},
     )
+
+
+def validate_package_native_inventory(package, flutter_root: Path,
+                                       expected_inventory: dict[str, str] | None = None) -> dict[str, str]:
+    """Fail before compression unless selected resource routes preserve every staged ELF byte."""
+    flutter_root = Path(flutter_root)
+    expected = expected_inventory if expected_inventory is not None else native_inventory(flutter_root)
+    prefix = FLUTTER_RELATIVE
+    routed: dict[str, str | None] = {}
+    for item in package.gen_resource(list(PUBLISHED_RESOURCES)):
+        destination = Path(item["out"])
+        try:
+            relative = destination.relative_to(prefix).as_posix()
+        except ValueError:
+            continue
+        source = item.get("src")
+        if isinstance(source, bytes):
+            digest = hashlib.sha256(source).hexdigest() if source.startswith(b"\x7fELF") else None
+        elif isinstance(source, Path) and source.is_file():
+            try:
+                with source.open("rb") as stream:
+                    is_elf = stream.read(4) == b"\x7fELF"
+                digest = sha256_file(source) if is_elf else None
+            except OSError as exc:
+                raise RepackError(f"cannot inspect packaged source for {relative}: {exc}") from exc
+        else:
+            digest = None
+        # This matches Package.debuild's final-writer behavior for declared overlays.
+        routed[relative] = digest
+    packaged = {path: digest for path, digest in routed.items() if digest is not None}
+    if packaged != expected:
+        missing = sorted(set(expected) - set(packaged))
+        unexpected = sorted(set(packaged) - set(expected))
+        changed = sorted(path for path in set(expected) & set(packaged) if expected[path] != packaged[path])
+        details = []
+        if missing:
+            details.append("missing=" + ",".join(missing[:8]))
+        if unexpected:
+            details.append("unexpected=" + ",".join(unexpected[:8]))
+        if changed:
+            details.append("changed=" + ",".join(changed[:8]))
+        raise RepackError("selected package resources do not preserve staged native ELF inventory: "
+                          + "; ".join(details))
+    return packaged
 
 
 def _apply_overlay(payload_root: Path, items: list[dict]) -> None:
@@ -613,10 +668,11 @@ def repack(source: Path, output: Path, *, engine_stamp_json: Path | None = None,
         if tool_args and any(char in tool_args for char in "\x00\n\r"):
             raise RepackError("FLUTTER_TOOL_ARGS contains an unsupported control character")
         (cache / "flutter_tools.stamp").write_text(f"{synthetic_head}:{tool_args}", encoding="utf-8")
+        old_native = native_inventory(root)
+        validate_package_native_inventory(pkg, root, old_native)
         dart_version, snapshot_size = _compile_and_load(root, tool_args, temporary / "runtime")
         snapshot = cache / "flutter_tools.snapshot"
         snapshot_sha = sha256_file(snapshot)
-        old_native = native_inventory(root)
 
         try:
             source_metadata = json.loads(source.with_name("build_metadata.json").read_text(encoding="utf-8"))

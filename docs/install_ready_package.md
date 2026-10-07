@@ -52,7 +52,11 @@ archived native Dart compiler to build and load a new kernel snapshot. It uses a
 private HOME/Pub cache/temp root and validates the candidate package plus every ELF
 byte hash before publishing the output without overwriting an existing file. Current
 package.yaml resources, wrappers, profile, postinst and configuration helpers are
-applied. The provenance file records the input archive, workspace commit, reused
+applied. Since the general package walker intentionally skips directories named
+`engine`, the repacker explicitly maps the archived `bin/cache/artifacts/engine`
+runtime subtree to its matching prefix-relative SDK destination. A pre-compression
+manifest check rejects any package resource set that omits or changes staged ELF
+bytes; the final extracted `.deb` is checked independently as well. The provenance file records the input archive, workspace commit, reused
 engine revision, Dart compiler, generated kernel hash, synthetic commit, and ELF
 inventory.
 
