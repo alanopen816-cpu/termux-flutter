@@ -14,27 +14,43 @@ def test_termux_smoke_script_syntax():
     assert res.returncode == 0, f"Syntax error in termux_smoke.sh: {res.stderr}"
 
 def test_termux_smoke_evidence_structure(tmp_path):
-    log_file = to_wsl_posix(tmp_path / "smoke.log")
-    deb_file = tmp_path / "dummy.deb"
-    deb_file.write_text("dummy deb")
-    deb_posix = to_wsl_posix(deb_file)
+    source = (REPO_ROOT / SCRIPT_PATH).read_text(encoding="utf-8")
+    functions_start = source.index("record_status() {")
+    functions_end = source.index("\ntrap write_evidence_json EXIT", functions_start)
+    evidence_functions = source[functions_start:functions_end]
 
     home_dir = tmp_path / "home"
     home_dir.mkdir()
-    home_posix = to_wsl_posix(home_dir)
+    marker_dir = tmp_path / "blocked-commands"
+    marker_dir.mkdir()
+    blocked_calls = tmp_path / "blocked-calls.log"
+    blocked_commands = ("su", "apt-get", "dpkg", "flutter", "dart", "adb", "am", "chmod")
+    for command in blocked_commands:
+        wrapper = marker_dir / command
+        wrapper.write_text(f"#!/bin/sh\necho {command} >> '{blocked_calls}'\nexit 99\n", encoding="utf-8")
+        wrapper.chmod(0o755)
 
-    bash_cmd = [
-        "bash", "-c",
-        f"export TERMUX_SMOKE_LOG='{log_file}'; "
-        f"export TERMUX_SMOKE_DEB='{deb_posix}'; "
-        f"export TERMUX_SMOKE_COMMIT_SHA='abc123def'; "
-        f"export HOME='{home_posix}'; "
-        f"bash ./{SCRIPT_PATH}"
-    ]
-
-    res = subprocess.run(bash_cmd, cwd=REPO_ROOT, capture_output=True, text=True)
+    # Evaluate only the evidence-formatting functions. Never execute the device
+    # smoke script's install, post-install, doctor, network, or build workflow.
+    harness = "\n".join((
+        "set -eu",
+        "getprop() { echo test-device; }",
+        "cp() { test \"$2\" = /sdcard/Download/evidence.json; }",
+        evidence_functions,
+        "record_status APK_HOST_VERIFY_REQUIRED 0",
+        "write_evidence_json",
+    ))
+    env = os.environ.copy()
+    env.update({
+        "HOME": str(home_dir),
+        "PATH": f"{marker_dir}{os.pathsep}{env.get('PATH', '')}",
+        "TERMUX_SMOKE_COMMIT_SHA": "abc123def",
+    })
+    res = subprocess.run(["bash", "-c", harness], cwd=REPO_ROOT, env=env, capture_output=True, text=True)
     ev_path = home_dir / ".termux_smoke" / "evidence.json"
     assert ev_path.exists(), f"evidence.json not created.\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+    assert res.returncode == 0, f"Evidence formatter failed: {res.stderr}"
+    assert not blocked_calls.exists(), f"Device workflow command unexpectedly ran: {blocked_calls.read_text()}"
 
     data = json.loads(ev_path.read_text())
     assert "status" in data

@@ -32,10 +32,15 @@ _DARTVM = _installed_dartvm()
 
 
 def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, str]:
-    """Return a subprocess environment whose persistent user state is test-local."""
+    """Return a subprocess environment with all user state and SDK roots test-local."""
     root = Path(state_root).resolve()
     home = root / "home"
+    prefix = root / "prefix"
+    flutter_root = root / "flutter-root"
+    android_home = prefix / "opt" / "android-sdk"
+    android_ndk = prefix / "opt" / "android-ndk"
     paths = {
+        "TEST_USER_STATE_ROOT": root,
         "HOME": home,
         "XDG_CONFIG_HOME": home / ".config",
         "XDG_CACHE_HOME": home / ".cache",
@@ -47,6 +52,16 @@ def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, 
         "ANDROID_USER_HOME": home / ".android",
         "ANDROID_SDK_HOME": home / ".android-sdk-home",
         "ANDROID_AVD_HOME": home / ".android/avd",
+        "PREFIX": prefix,
+        "FLUTTER_ROOT": flutter_root,
+        "DART_SDK": flutter_root / "bin" / "cache" / "dart-sdk",
+        "ANDROID_HOME": android_home,
+        "ANDROID_SDK_ROOT": android_home,
+        "ANDROID_SDK": android_home,
+        "ANDROID_NDK_HOME": android_ndk,
+        "ANDROID_NDK_ROOT": android_ndk,
+        "ANDROID_NDK": android_ndk,
+        "NDK_ROOT": android_ndk,
         "TMPDIR": root / "tmp",
         "TMP": root / "tmp",
         "TEMP": root / "tmp",
@@ -55,7 +70,27 @@ def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, 
         path.mkdir(parents=True, exist_ok=True)
     paths["XDG_RUNTIME_DIR"].chmod(0o700)
     env = os.environ.copy() if base_env is None else dict(base_env)
+
+    # Keep native Termux utilities available, but never resolve Flutter from a
+    # caller's installed SDK. Tests that need a fixture Flutter command install
+    # an explicit mock in the fixture prefix.
+    old_roots = []
+    for value in (env.get("FLUTTER_ROOT"),):
+        if value:
+            old_roots.append(Path(value).expanduser().resolve())
+    old_prefix = env.get("PREFIX")
+    if old_prefix:
+        old_roots.append((Path(old_prefix).expanduser() / "opt" / "flutter").resolve())
+    filtered_path = []
+    for entry in env.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        candidate = Path(entry).expanduser().resolve()
+        if any(candidate == old_root or candidate.is_relative_to(old_root) for old_root in old_roots):
+            continue
+        filtered_path.append(entry)
     env.update({key: str(value) for key, value in paths.items()})
+    env["PATH"] = os.pathsep.join(filtered_path)
     if env.get("DARTVM"):
         env["DARTVM"] = str(Path(env["DARTVM"]).expanduser().resolve())
     elif _DARTVM:
@@ -64,9 +99,9 @@ def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, 
 
 
 @pytest.fixture(autouse=True)
-def isolate_test_user_state(tmp_path, monkeypatch):
-    """Prevent tests and child processes from writing persistent HOME/XDG caches."""
-    env = isolated_user_env(tmp_path / ".pytest-user-state")
+def isolate_test_user_state(tmp_path_factory, monkeypatch):
+    """Prevent tests and children from using caller caches or installed SDK roots."""
+    env = isolated_user_env(tmp_path_factory.mktemp("pytest-user-state"))
     for key in (
         "HOME",
         "XDG_CONFIG_HOME",
@@ -82,6 +117,18 @@ def isolate_test_user_state(tmp_path, monkeypatch):
         "TMPDIR",
         "TMP",
         "TEMP",
+        "TEST_USER_STATE_ROOT",
+        "PATH",
+        "PREFIX",
+        "FLUTTER_ROOT",
+        "DART_SDK",
+        "ANDROID_HOME",
+        "ANDROID_SDK_ROOT",
+        "ANDROID_SDK",
+        "ANDROID_NDK_HOME",
+        "ANDROID_NDK_ROOT",
+        "ANDROID_NDK",
+        "NDK_ROOT",
         "DARTVM",
     ):
         if key in env:
