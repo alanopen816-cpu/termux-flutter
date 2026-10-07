@@ -140,10 +140,15 @@ REQUIRED_DEB_INSTALLER_ARTIFACTS = (
     'share/flutter/post_install.sh',
     'share/flutter/configure_android.py',
     'share/flutter/flutter_package_bootstrap.py',
+    'share/flutter/strip_release_engine.py',
 )
 
 REQUIRED_DEB_ARTIFACTS = (
     REQUIRED_DEB_EXECUTABLE_ARTIFACTS + REQUIRED_DEB_TOOL_ARTIFACTS + REQUIRED_DEB_INSTALLER_ARTIFACTS
+)
+
+ANDROID_ARM64_RELEASE_ENGINE = (
+    'opt/flutter/bin/cache/artifacts/engine/android-arm64-release/libflutter.so'
 )
 
 
@@ -247,6 +252,7 @@ def validate_deb_artifacts(path):
 
     found = {}
     archive_names = set()
+    packaged_flutter_libraries = []
     with tarfile.open(fileobj=io.BytesIO(data_member), mode='r:*') as data_tar:
         for member in data_tar:
             name = _normalize_deb_payload_path(member.name)
@@ -259,12 +265,41 @@ def validate_deb_artifacts(path):
                 continue
             if name in REQUIRED_DEB_ARTIFACTS:
                 found[name] = member
+            if name == ANDROID_ARM64_RELEASE_ENGINE:
+                packaged_flutter_libraries.append((name, member))
 
     missing = [it for it in REQUIRED_DEB_ARTIFACTS if it not in found]
     if missing:
         raise RuntimeError(
             'deb missing required Flutter runtime artifact(s): '
             + ', '.join(missing))
+
+    # Validate only the unambiguous Android ARM64 release engine cache path. APK contents
+    # and debug/profile artifacts have no mode evidence here and must not inherit this rule.
+    for relative, member in packaged_flutter_libraries:
+        with tempfile.TemporaryDirectory(prefix='flutter-deb-engine-validation-') as directory:
+            candidate = Path(directory) / 'libflutter.so'
+            with tarfile.open(fileobj=io.BytesIO(data_member), mode='r:*') as data_tar:
+                stream = data_tar.extractfile(member)
+                if stream is None:
+                    raise RuntimeError(f'deb release engine library could not be read: {relative}')
+                with candidate.open('wb') as output:
+                    shutil.copyfileobj(stream, output)
+            try:
+                from scripts.install.strip_release_engine import _has_debug_or_static_symbols, inspect_elf
+
+                elf = inspect_elf(candidate)
+                has_debug_or_static_symbols = _has_debug_or_static_symbols(elf)
+            except ImportError as exc:
+                raise RuntimeError('release engine validation helper is unavailable') from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f'deb contains an invalid Android ARM64 release engine library: {relative}: {exc}'
+                ) from exc
+            if has_debug_or_static_symbols or elf.file_size > 64 * 1024 * 1024:
+                raise RuntimeError(
+                    f'deb contains an unstripped or oversized Android ARM64 release engine library: {relative}'
+                )
 
     non_executable = [
         it for it, member in found.items()

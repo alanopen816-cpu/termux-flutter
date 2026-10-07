@@ -365,6 +365,84 @@ patch_plugin_utils() {
 }
 register_patch "plugin_utils" "$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main/kotlin/FlutterPluginUtils.kt" patch_plugin_utils
 
+patch_release_engine_strip() {
+    python3 - "$1" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+import_line = "import org.gradle.api.tasks.Copy\n"
+import_addition = import_line + "import org.gradle.api.tasks.PathSensitivity\n"
+if "import org.gradle.api.tasks.PathSensitivity" not in source:
+    if source.count(import_line) != 1:
+        raise SystemExit("unable to locate FlutterPlugin task imports for release strip patch")
+    source = source.replace(import_line, import_addition, 1)
+marker = "            val compileTaskName = flutterCompileTaskName(variant.name)\n"
+addition = marker + '''            if (FlutterPluginUtils.isFlutterAppProject(projectToAddTasksTo) &&
+                variant.buildType == "release" &&
+                OperatingSystem.current().isLinux && !System.getenv("TERMUX_VERSION").isNullOrEmpty()) {
+                val stripTaskName = "strip${FlutterPluginUtils.capitalize(variant.name)}DebugSymbols"
+                projectToAddTasksTo.tasks.configureEach {
+                    if (name == stripTaskName) {
+                        val prefix = System.getenv("PREFIX")
+                            ?: throw GradleException("PREFIX is required for Termux release stripping")
+                        val stripHelper = File(prefix, "share/flutter/strip_release_engine.py")
+                        val stripTool = File(prefix, "bin/llvm-strip")
+                        val python = File(prefix, "bin/python")
+                        inputs.file(stripHelper).withPropertyName("termuxStripHelper").withPathSensitivity(PathSensitivity.NONE)
+                        inputs.file(stripTool).withPropertyName("termuxLlvmStrip").withPathSensitivity(PathSensitivity.NONE)
+                        inputs.file(python).withPropertyName("termuxPython").withPathSensitivity(PathSensitivity.NONE)
+                        doLast {
+                            val stripTask = this
+                            val stagedLibraries = stripTask.outputs.files.files
+                                .filter { it.isDirectory }
+                                .flatMap { output -> output.walkTopDown().filter {
+                                    it.isFile && it.name == "libflutter.so" && it.parentFile.name == "arm64-v8a"
+                                }.toList() }
+                                .distinctBy { it.canonicalPath }
+                            if (stagedLibraries.size != 1) {
+                                throw GradleException("Expected exactly one staged release ARM64 libflutter.so; found ${stagedLibraries.size}")
+                            }
+                            val stagedLibrary = stagedLibraries.single()
+                            val stagedPath = stagedLibrary.canonicalPath
+                            val expectedStage = File.separator + "intermediates" + File.separator +
+                                "stripped_native_libs" + File.separator + "release" + File.separator
+                            if (!stagedPath.contains(expectedStage)) {
+                                throw GradleException("Refusing to strip library outside AGP staged release JNI output")
+                            }
+                            projectToAddTasksTo.serviceOf<ExecOperations>().exec {
+                                commandLine(python.absolutePath, stripHelper.absolutePath,
+                                    "--variant", "release", "--library", stagedLibrary.absolutePath,
+                                    "--llvm-strip", stripTool.absolutePath)
+                            }.assertNormalExitValue()
+                        }
+                    }
+                }
+            }
+'''
+if addition not in source:
+    if source.count(marker) != 1:
+        raise SystemExit("unable to locate FlutterPlugin variant task registration for release strip patch")
+    source = source.replace(marker, addition, 1)
+    mode = path.stat().st_mode
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            stream.write(source)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+if addition not in path.read_text(encoding="utf-8"):
+    raise SystemExit("release engine strip patch verification failed")
+PY
+}
+register_patch "release_engine_strip" "$FLUTTER_ROOT/packages/flutter_tools/gradle/src/main/kotlin/FlutterPlugin.kt" patch_release_engine_strip
+
 patch_flutter_cache() {
     local file="$1"
     local font_preimage='final List<String>? binaryDirs = artifacts[_platform.operatingSystem];'

@@ -24,7 +24,48 @@ def _write_android_elf(path):
     path.chmod(0o755)
 
 
-def _make_valid_prefixed_deb(tmp_path, *, add_bare_package_alias=False, escape_package_root=False):
+def _write_engine_shared_object(path, *, machine=183, debug=False, size=None):
+    names = b"\0.text\0.debug_info\0.shstrtab\0" if debug else b"\0.text\0.shstrtab\0"
+    text_offset = 64 + 56
+    text = b"TEXT"
+    debug_offset = text_offset + len(text)
+    debug_data = b"debug" if debug else b""
+    names_offset = debug_offset + len(debug_data)
+    section_offset = names_offset + len(names)
+    ident = b"\x7fELF" + bytes((2, 1, 1, 0)) + bytes(8)
+    section_count = 4 if debug else 3
+    names_index = section_count - 1
+    header = struct.pack("<16sHHIQQQIHHHHHH", ident, 3, machine, 1, 0x1000,
+                         64, section_offset, 0, 64, 56, 1, 64, section_count, names_index)
+    program = struct.pack("<IIQQQQQQ", 1, 5, text_offset, 0x1000, 0x1000,
+                          len(text), len(text), 4096)
+    null_section = bytes(64)
+    text_name = 1
+    text_section = struct.pack("<IIQQQQIIQQ", text_name, 1, 2, 0x1000,
+                               text_offset, len(text), 0, 0, 4, 0)
+    if debug:
+        debug_name = names.index(b".debug_info")
+        debug_section = struct.pack("<IIQQQQIIQQ", debug_name, 1, 0, 0,
+                                    debug_offset, len(debug_data), 0, 0, 1, 0)
+        names_name = names.index(b".shstrtab")
+        names_section = struct.pack("<IIQQQQIIQQ", names_name, 3, 0, 0,
+                                    names_offset, len(names), 0, 0, 1, 0)
+        sections = null_section + text_section + debug_section + names_section
+    else:
+        names_name = names.index(b".shstrtab")
+        names_section = struct.pack("<IIQQQQIIQQ", names_name, 3, 0, 0,
+                                    names_offset, len(names), 0, 0, 1, 0)
+        sections = null_section + text_section + names_section
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as stream:
+        stream.write(header + program + text + debug_data + names + sections)
+        if size is not None:
+            stream.truncate(size)
+    return path
+
+
+def _make_valid_prefixed_deb(tmp_path, *, add_bare_package_alias=False, escape_package_root=False,
+                             omit_installer_artifact=None, bundled_flutter_library=None):
     root = tmp_path / "package"
     prefix = root / "data/data/com.termux/files/usr"
     sdk = prefix / "opt/flutter"
@@ -41,6 +82,9 @@ def _make_valid_prefixed_deb(tmp_path, *, add_bare_package_alias=False, escape_p
         path = sdk / relative.removeprefix("opt/flutter/")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"fixture")
+    if bundled_flutter_library is not None:
+        relative, options = bundled_flutter_library
+        _write_engine_shared_object(sdk / relative, **options)
     revision = "a" * 40
     (sdk / "bin/internal/engine.version").write_text(revision)
     (sdk / "bin/cache/engine_stamp.stamp").write_text(revision)
@@ -64,6 +108,8 @@ def _make_valid_prefixed_deb(tmp_path, *, add_bare_package_alias=False, escape_p
                                                   else "../../../.pub-cache/hosted/pub.dev/example-1.0.0/")}
     ]}))
     for relative in build.REQUIRED_DEB_INSTALLER_ARTIFACTS:
+        if relative == omit_installer_artifact:
+            continue
         script = prefix / relative
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("#!/bin/sh\nexit 0\n")
@@ -114,6 +160,59 @@ def test_validator_rejects_percent_encoded_package_root_escape(tmp_path):
     deb = _make_valid_prefixed_deb(tmp_path, escape_package_root=True)
 
     with pytest.raises(RuntimeError, match="escapes the packaged Flutter SDK"):
+        build.validate_deb_artifacts(deb)
+
+
+def test_validator_requires_release_strip_helper_in_package(tmp_path):
+    deb = _make_valid_prefixed_deb(
+        tmp_path, omit_installer_artifact="share/flutter/strip_release_engine.py")
+
+    with pytest.raises(RuntimeError, match="share/flutter/strip_release_engine.py"):
+        build.validate_deb_artifacts(deb)
+
+
+def test_android_maven_engine_is_not_a_required_deb_payload():
+    assert "opt/flutter/libflutter.so" not in build.REQUIRED_DEB_ARTIFACTS
+    assert "share/flutter/strip_release_engine.py" in build.REQUIRED_DEB_ARTIFACTS
+
+
+def test_validator_rejects_unstripped_library_at_android_arm64_release_path(tmp_path):
+    deb = _make_valid_prefixed_deb(tmp_path, bundled_flutter_library=(
+        "bin/cache/artifacts/engine/android-arm64-release/libflutter.so",
+        {"debug": True},
+    ))
+
+    with pytest.raises(RuntimeError, match="unstripped.*release engine"):
+        build.validate_deb_artifacts(deb)
+
+
+def test_validator_rejects_oversized_library_at_android_arm64_release_path(tmp_path):
+    deb = _make_valid_prefixed_deb(tmp_path, bundled_flutter_library=(
+        "bin/cache/artifacts/engine/android-arm64-release/libflutter.so",
+        {"size": 64 * 1024 * 1024 + 1},
+    ))
+
+    with pytest.raises(RuntimeError, match="unstripped.*release engine"):
+        build.validate_deb_artifacts(deb)
+
+
+@pytest.mark.parametrize("mode", ["debug", "profile"])
+def test_validator_does_not_apply_release_guard_to_debug_or_profile_libraries(tmp_path, mode):
+    deb = _make_valid_prefixed_deb(tmp_path, bundled_flutter_library=(
+        f"bin/cache/artifacts/engine/android-arm64-{mode}/libflutter.so",
+        {"debug": True, "size": 64 * 1024 * 1024 + 1},
+    ))
+
+    assert build.validate_deb_artifacts(deb) is None
+
+
+def test_validator_rejects_wrong_isa_android_arm64_release_library(tmp_path):
+    deb = _make_valid_prefixed_deb(tmp_path, bundled_flutter_library=(
+        "bin/cache/artifacts/engine/android-arm64-release/libflutter.so",
+        {"machine": 62},
+    ))
+
+    with pytest.raises(RuntimeError, match="AArch64"):
         build.validate_deb_artifacts(deb)
 
 

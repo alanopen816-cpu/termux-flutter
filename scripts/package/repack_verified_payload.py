@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 FLUTTER_VERSION = "3.47.2"
-PACKAGE_VERSION = "3.47.2-3"
+PACKAGE_VERSION = "3.47.2-4"
 PREFIX_RELATIVE = Path("data/data/com.termux/files/usr")
 FLUTTER_RELATIVE = PREFIX_RELATIVE / "opt/flutter"
 AT_FDCWD = -100
@@ -38,6 +38,7 @@ PUBLISHED_RESOURCES = (
     "post_install",
     "configure_android",
     "flutter_package_bootstrap",
+    "release_engine_stripper",
     "verified_engine_cache",
 )
 PATCH_FUNCTIONS = (
@@ -46,6 +47,7 @@ PATCH_FUNCTIONS = (
     ("patch_create_gradle_wrapper", "packages/flutter_tools/lib/src/commands/create_base.dart"),
     ("patch_compile_sdk", "packages/flutter_tools/gradle/src/main/kotlin/FlutterExtension.kt"),
     ("patch_plugin_utils", "packages/flutter_tools/gradle/src/main/kotlin/FlutterPluginUtils.kt"),
+    ("patch_release_engine_strip", "packages/flutter_tools/gradle/src/main/kotlin/FlutterPlugin.kt"),
     ("patch_shebang_flutter", "bin/flutter"),
     ("patch_shebang_shared", "bin/internal/shared.sh"),
     ("patch_shebang_update_dart", "bin/internal/update_dart_sdk.sh"),
@@ -340,6 +342,7 @@ def _package_object(root: Path, repo_root: Path, package_yaml: dict):
     resources["post_install"] = dict(resources["post_install"], source=str(repo_root / "scripts/install/post_install.sh"))
     resources["configure_android"] = dict(resources["configure_android"], source=str(repo_root / "scripts/install/configure_android.py"))
     resources["flutter_package_bootstrap"] = dict(resources["flutter_package_bootstrap"], source=str(repo_root / "scripts/install/flutter_package_bootstrap.py"))
+    resources["release_engine_stripper"] = dict(resources["release_engine_stripper"], source=str(repo_root / "scripts/install/strip_release_engine.py"))
     engine_cache = Path(root) / "bin/cache/artifacts/engine"
     if engine_cache.is_symlink() or not engine_cache.is_dir():
         raise RepackError(f"verified archive is missing its runtime engine cache tree: {engine_cache}")
@@ -879,7 +882,7 @@ def repack(source: Path, output: Path, *, engine_stamp_json: Path | None = None,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path.home() / "termux-flutter/flutter-termux-3.47.2-arm64/flutter_3.47.2_aarch64.deb")
-    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[2] / "artifacts/install-ready-r3/flutter_3.47.2_aarch64.deb")
+    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[2] / "artifacts/install-ready-r4/flutter_3.47.2_aarch64.deb")
     parser.add_argument("--engine-stamp-json", type=Path, help="read-only engine metadata whose revision must match the archived engine.version")
     parser.add_argument("--tool-args", default=None, help="FlutterTools compile key arguments; defaults to FLUTTER_TOOL_ARGS or empty")
     args = parser.parse_args(argv)
