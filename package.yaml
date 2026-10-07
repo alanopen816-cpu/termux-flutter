@@ -13,7 +13,7 @@ control:
   Architecture: $architecture
   Maintainer: Termux Flutter WSL <termux-flutter-wsl@github.com>
   Pre-Depends: x11-repo
-  Depends: git, which, openjdk-21, wget, unzip, binutils, clang
+  Depends: bash, python, git, aapt, aapt2, android-tools, which, openjdk-21, wget, unzip, binutils, clang
   Recommends: gtk3, xorgproto, ninja, cmake, pkg-config
   Homepage: https://github.com/ImL1s/termux-flutter-wsl
   Description: Flutter makes it easy and fast to build beautiful apps for mobile and beyond
@@ -22,6 +22,12 @@ resource:
   flutter:
     source: $root
     output: $distro
+
+  flutter_tools_git:
+    source: $root/bin/cache/flutter_tools_git
+    output: $distro/.git
+    replace: true
+    replace_scope: $distro/.git
 
   flutter_gpu:
     source: $root/engine/src/flutter/lib/gpu
@@ -220,6 +226,8 @@ resource:
       PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
       export PATH=${PREFIX}/opt/flutter/bin:${PATH}
       export TMPDIR="${PREFIX}/tmp"
+      export ANDROID_HOME="${PREFIX}/opt/android-sdk"
+      export ANDROID_SDK_ROOT="${PREFIX}/opt/android-sdk"
       export FLUTTER_PREBUILT_ENGINE_VERSION="$version"
       # Force Gradle to use our pre-configured NDK (prevents auto-download of new versions)
       if [ -z "${ANDROID_NDK_HOME:-}" ]; then
@@ -322,6 +330,11 @@ resource:
     output: $prefix/share/flutter/configure_android.py
     mode: 0o755
 
+  flutter_package_bootstrap:
+    source: $root/../scripts/install/flutter_package_bootstrap.py
+    output: $prefix/share/flutter/flutter_package_bootstrap.py
+    mode: 0o755
+
   check_toolchain:
     source: $root/../scripts/ci/check_toolchain.sh
     output: $prefix/share/flutter/check_toolchain.sh
@@ -388,3 +401,6 @@ resource:
     mode: 0o644
     replace: true
     replace_scope: $prefix
+
+maintainer_scripts:
+  postinst: $root/../scripts/install/postinst.sh

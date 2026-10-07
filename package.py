@@ -288,11 +288,14 @@ class Output(utils.Output):
 
 @utils.record
 class Package(object):
-    def __init__(self, root, arch, control, resource, define=None, tag=None, release_tag=None, revision=None, **kwargs):
+    def __init__(self, root, arch, control, resource, define=None, tag=None, release_tag=None, revision=None,
+                 maintainer_scripts=None, **kwargs):
         root = Path(root).resolve()
         assert root.is_dir(), f'bad flutter root path: "{root}"'
         tag_val = tag or utils.flutter_tag(root)
-        rev_val = str(revision) if revision is not None else str(kwargs.get('revision', '0'))
+        rev_val = str(revision) if revision is not None else str(kwargs.get('revision', '1'))
+        if rev_val == '0':
+            rev_val = '1'
         pkg_ver = f"{tag_val}-{rev_val}" if rev_val and str(rev_val) != '0' else tag_val
         self.globals = {
             'tag': tag_val,
@@ -315,6 +318,12 @@ class Package(object):
         }
         self.control = control
         self.resource = resource
+        self.maintainer_scripts = maintainer_scripts or {}
+        if not isinstance(self.maintainer_scripts, dict):
+            raise ValueError('maintainer_scripts must be a mapping')
+        unsupported_scripts = set(self.maintainer_scripts) - {'postinst'}
+        if unsupported_scripts:
+            raise ValueError('unsupported maintainer script(s): ' + ', '.join(sorted(unsupported_scripts)))
         self.validate_control_headers()
         self.__dict__.update(self.globals)
         self.__dict__.update(self.defines)
@@ -343,6 +352,23 @@ class Package(object):
         for k, v in self.control.items():
             bin.write(self.__format__(f'{k}: {v}\n').encode('utf8'))
         return {'out': 'control', 'src': bin.getvalue()}
+
+    def gen_control_files(self):
+        """Yield the Debian control file and explicitly configured maintainer scripts."""
+        yield self.gen_control()
+        for name, source in sorted(self.maintainer_scripts.items()):
+            source_path = Path(self.__format__(str(source)))
+            if source_path.is_symlink():
+                raise FileNotFoundError(f'missing or unsafe maintainer script {name}: {source_path}')
+            path = source_path.resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f'missing or unsafe maintainer script {name}: {path}')
+            content = path.read_bytes()
+            if not content.startswith(b'#!'):
+                raise ValueError(f'maintainer script {name} must have a shebang')
+            if path.stat().st_mode & 0o111 == 0:
+                raise ValueError(f'maintainer script {name} is not executable: {path}')
+            yield {'out': name, 'src': content, 'mod': 0o755}
 
     def gen_resource(self, name=None):
         if isinstance(name, str):
@@ -529,7 +555,7 @@ class Package(object):
             with open(info, 'wb+') as f:
                 f.write(b'2.0\n')
 
-            tar(ctrl, self.gen_control())
+            tar(ctrl, self.gen_control_files())
             tar(data, track_resources())
 
             tmp_deb = tmp / output.name

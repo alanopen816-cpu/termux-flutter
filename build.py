@@ -18,6 +18,8 @@ import platform
 import posixpath
 import subprocess
 import struct
+import tempfile
+from urllib.parse import quote, unquote, urlparse
 from loguru import logger
 from pathlib import Path
 from sysroot import Sysroot
@@ -110,7 +112,7 @@ def validate_wsl_mount(path: str) -> None:
             )
 
 
-REQUIRED_DEB_ARTIFACTS = (
+REQUIRED_DEB_EXECUTABLE_ARTIFACTS = (
     'opt/flutter/bin/cache/dart-sdk/bin/dart',
     'opt/flutter/bin/cache/dart-sdk/bin/dartvm',
     'opt/flutter/bin/cache/dart-sdk/bin/dartaotruntime',
@@ -118,28 +120,54 @@ REQUIRED_DEB_ARTIFACTS = (
     'opt/flutter/bin/cache/artifacts/engine/android-arm64-profile/linux-arm64/gen_snapshot',
 )
 
+REQUIRED_DEB_TOOL_ARTIFACTS = (
+    'opt/flutter/packages/flutter_tools/bin/flutter_tools.dart',
+    'opt/flutter/packages/flutter_tools/pubspec.yaml',
+    'opt/flutter/packages/flutter_tools/pubspec.lock',
+    'opt/flutter/packages/flutter_tools/.dart_tool/package_config.json',
+    'opt/flutter/bin/cache/flutter_tools.snapshot',
+    'opt/flutter/bin/cache/flutter_tools.stamp',
+    'opt/flutter/bin/cache/engine_stamp.json',
+    'opt/flutter/bin/cache/engine_stamp.stamp',
+    'opt/flutter/bin/internal/engine.version',
+    'opt/flutter/bin/cache/dart-sdk/bin/resources/devtools/version.json',
+    'opt/flutter/.git/HEAD',
+    'opt/flutter/.git/refs/heads/stable',
+    'opt/flutter/.git/termux_synthetic',
+)
+
+REQUIRED_DEB_INSTALLER_ARTIFACTS = (
+    'share/flutter/post_install.sh',
+    'share/flutter/configure_android.py',
+    'share/flutter/flutter_package_bootstrap.py',
+)
+
+REQUIRED_DEB_ARTIFACTS = (
+    REQUIRED_DEB_EXECUTABLE_ARTIFACTS + REQUIRED_DEB_TOOL_ARTIFACTS + REQUIRED_DEB_INSTALLER_ARTIFACTS
+)
+
 
 def _validate_android_gen_snapshot_bytes(data, *, executable, source):
     """Validate a Termux-hosted ARM64 ELF before it is reused or packaged."""
     if not executable:
-        raise RuntimeError(f'Android gen_snapshot is not executable: {source}')
+        raise RuntimeError(f'Android ARM64 executable is not executable: {source}')
     header_format = '<16sHHIQQQIHHHHHH'
     header_size = struct.calcsize(header_format)
     if len(data) < header_size:
-        raise ValueError(f'Android gen_snapshot is not a valid ELF64 file: {source}')
+        raise ValueError(f'Android ARM64 executable is not a valid ELF64 file: {source}')
     (ident, elf_type, machine, version, _entry, phoff, _shoff, _flags,
      ehsize, phentsize, phnum, _shentsize, _shnum, _shstrndx) = struct.unpack_from(
         header_format, data)
     if ident[:4] != b'\x7fELF' or ident[4:6] != b'\x02\x01' or version != 1:
-        raise ValueError(f'Android gen_snapshot must be ELF64 little-endian: {source}')
+        raise ValueError(f'Android ARM64 executable must be ELF64 little-endian: {source}')
     if machine != 183:
-        raise ValueError(f'Android gen_snapshot must target AArch64 (EM_AARCH64): {source}')
+        raise ValueError(f'Android ARM64 executable must target AArch64 (EM_AARCH64): {source}')
     if elf_type not in (2, 3) or ehsize < header_size:
-        raise ValueError(f'Android gen_snapshot has an invalid executable ELF header: {source}')
+        raise ValueError(f'Android ARM64 executable has an invalid ELF header: {source}')
     ph_format = '<IIQQQQQQ'
     minimum_phentsize = struct.calcsize(ph_format)
     if phentsize < minimum_phentsize or phoff + phentsize * phnum > len(data):
-        raise ValueError(f'Android gen_snapshot has a truncated ELF program table: {source}')
+        raise ValueError(f'Android ARM64 executable has a truncated ELF program table: {source}')
     interpreter = None
     for index in range(phnum):
         offset = phoff + index * phentsize
@@ -147,15 +175,15 @@ def _validate_android_gen_snapshot_bytes(data, *, executable, source):
             ph_format, data, offset)
         if p_type == 3:  # PT_INTERP
             if p_filesz == 0 or p_offset + p_filesz > len(data):
-                raise ValueError(f'Android gen_snapshot has an invalid ELF interpreter: {source}')
+                raise ValueError(f'Android ARM64 executable has an invalid ELF interpreter: {source}')
             raw_interpreter = data[p_offset:p_offset + p_filesz]
             if not raw_interpreter.endswith(b'\0'):
-                raise ValueError(f'Android gen_snapshot has an unterminated ELF interpreter: {source}')
+                raise ValueError(f'Android ARM64 executable has an unterminated ELF interpreter: {source}')
             interpreter = raw_interpreter[:-1].decode('ascii', errors='replace')
             break
     if interpreter != '/system/bin/linker64':
         raise ValueError(
-            f'Android gen_snapshot ELF interpreter must be /system/bin/linker64, '
+            f'Android ARM64 executable interpreter must be /system/bin/linker64, '
             f'found {interpreter!r}: {source}')
 
 
@@ -190,14 +218,18 @@ def _ar_members(path):
 
 
 def validate_deb_artifacts(path):
-    """Fail packaging if required Termux runtime binaries are missing."""
+    """Fail packaging when native runtimes, real FlutterTools inputs, or postinst are absent."""
     data_member = None
+    control_member = None
     for name, data in _ar_members(path):
         if name.startswith('data.tar'):
             data_member = data
-            break
+        elif name.startswith('control.tar'):
+            control_member = data
     if data_member is None:
         raise ValueError(f'data archive not found in deb: "{path}"')
+    if control_member is None:
+        raise ValueError(f'control archive not found in deb: "{path}"')
 
     found = {}
     with tarfile.open(fileobj=io.BytesIO(data_member), mode='r:*') as data_tar:
@@ -217,14 +249,15 @@ def validate_deb_artifacts(path):
 
     non_executable = [
         it for it, member in found.items()
-        if member.mode & 0o111 == 0
+        if (it in REQUIRED_DEB_EXECUTABLE_ARTIFACTS or it in REQUIRED_DEB_INSTALLER_ARTIFACTS)
+        and member.mode & 0o111 == 0
     ]
     if non_executable:
         raise RuntimeError(
             'deb runtime artifact(s) are not executable: '
             + ', '.join(non_executable))
 
-    for suffix in REQUIRED_DEB_ARTIFACTS[-2:]:
+    for suffix in REQUIRED_DEB_EXECUTABLE_ARTIFACTS:
         member = found[suffix]
         with tarfile.open(fileobj=io.BytesIO(data_member), mode='r:*') as data_tar:
             stream = data_tar.extractfile(member)
@@ -232,6 +265,64 @@ def validate_deb_artifacts(path):
                 raise RuntimeError(f'deb artifact could not be read: {suffix}')
             _validate_android_gen_snapshot_bytes(
                 stream.read(), executable=bool(member.mode & 0o111), source=suffix)
+
+    payloads = {}
+    with tarfile.open(fileobj=io.BytesIO(data_member), mode='r:*') as data_tar:
+        archive_names = {member.name.lstrip('./') for member in data_tar}
+        for suffix in REQUIRED_DEB_TOOL_ARTIFACTS:
+            member = found[suffix]
+            stream = data_tar.extractfile(member)
+            payloads[suffix] = stream.read() if stream is not None else b''
+    empty_inputs = [suffix for suffix, payload in payloads.items() if not payload]
+    if empty_inputs:
+        raise RuntimeError('deb contains empty required FlutterTools input(s): ' + ', '.join(empty_inputs))
+    snapshot = payloads['opt/flutter/bin/cache/flutter_tools.snapshot']
+    if len(snapshot) < 8 or snapshot[:4] != b'\x90\xab\xcd\xef':
+        raise RuntimeError('deb FlutterTools snapshot is not a nonempty Dart kernel snapshot')
+    try:
+        engine = payloads['opt/flutter/bin/internal/engine.version'].decode().strip()
+        engine_json = json.loads(payloads['opt/flutter/bin/cache/engine_stamp.json'])
+        if (payloads['opt/flutter/bin/cache/engine_stamp.stamp'].decode().strip() != engine
+                or engine_json.get('git_revision') != engine):
+            raise ValueError('engine cache markers disagree')
+        head = payloads['opt/flutter/.git/HEAD'].decode().strip()
+        ref_prefix = 'ref: refs/heads/'
+        if not head.startswith(ref_prefix):
+            raise ValueError('synthetic Git HEAD is not a symbolic branch')
+        ref_path = 'opt/flutter/.git/' + head[len('ref: '):]
+        git_revision = payloads.get(ref_path)
+        if git_revision is None:
+            raise ValueError('synthetic Git branch reference is missing')
+        git_revision = git_revision.decode().strip()
+        if len(git_revision) != 40 or any(char not in '0123456789abcdef' for char in git_revision.lower()):
+            raise ValueError('synthetic Git branch reference is not a full commit id')
+        if payloads['opt/flutter/bin/cache/flutter_tools.stamp'].decode().strip() != git_revision + ':':
+            raise ValueError('FlutterTools stamp does not match synthetic Git HEAD and default tool args')
+        package_config = json.loads(payloads['opt/flutter/packages/flutter_tools/.dart_tool/package_config.json'])
+        if package_config.get('configVersion') != 2 or not isinstance(package_config.get('packages'), list):
+            raise ValueError('FlutterTools package_config.json is invalid')
+        for package in package_config['packages']:
+            uri = package.get('rootUri') if isinstance(package, dict) else None
+            if not isinstance(uri, str) or urlparse(uri).scheme:
+                raise ValueError('package root URI must be relative to the Flutter SDK')
+            normalized = posixpath.normpath(posixpath.join(
+                'opt/flutter/packages/flutter_tools/.dart_tool', unquote(uri)))
+            if normalized != 'opt/flutter' and not normalized.startswith('opt/flutter/'):
+                raise ValueError('package root URI escapes the packaged Flutter SDK')
+            if not any(name == normalized or name.startswith(normalized.rstrip('/') + '/') for name in archive_names):
+                raise ValueError(f'package root is absent from the deb: {uri}')
+        devtools = json.loads(payloads['opt/flutter/bin/cache/dart-sdk/bin/resources/devtools/version.json'])
+        if not isinstance(devtools, dict) or not isinstance(devtools.get('version'), str) or not devtools['version'].strip():
+            raise ValueError('DevTools version metadata has no nonempty string version')
+    except (UnicodeError, ValueError, KeyError, AttributeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f'deb contains invalid FlutterTools cache provenance: {exc}') from exc
+    try:
+        with tarfile.open(fileobj=io.BytesIO(control_member), mode='r:*') as control_tar:
+            postinst = control_tar.getmember('postinst')
+    except (KeyError, tarfile.TarError) as exc:
+        raise RuntimeError('deb control archive is missing executable postinst') from exc
+    if not postinst.isfile() or postinst.mode & 0o111 == 0:
+        raise RuntimeError('deb control archive postinst is not executable')
 
     logger.info(
         '✓ Validated deb runtime artifacts: '
@@ -284,6 +375,51 @@ def package_config_uris_outside_tree(package_config_path, tree_root) -> list:
             except ValueError:
                 outside.append(uri)
     return outside
+
+
+def normalize_flutter_tools_package_config(package_config_path, tree_root) -> None:
+    """Rewrite resolved package roots as relocatable URIs inside the packaged Flutter tree."""
+    config_path = Path(package_config_path)
+    tree = Path(tree_root).resolve()
+    if config_path.is_symlink() or not config_path.is_file():
+        raise RuntimeError(f'FlutterTools package_config.json is missing or unsafe: {config_path}')
+    try:
+        config = json.loads(config_path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f'FlutterTools package_config.json is invalid: {exc}') from exc
+    if not isinstance(config, dict) or config.get('configVersion') != 2 or not isinstance(config.get('packages'), list):
+        raise RuntimeError('FlutterTools package_config.json has an unsupported structure')
+    for item in config['packages']:
+        if not isinstance(item, dict) or not isinstance(item.get('rootUri'), str):
+            raise RuntimeError('FlutterTools package_config.json contains an invalid package entry')
+        parsed = urlparse(item['rootUri'])
+        if parsed.scheme not in ('', 'file') or (parsed.scheme == 'file' and parsed.netloc not in ('', 'localhost')):
+            raise RuntimeError(f'FlutterTools package root is not a local file URI: {item["rootUri"]}')
+        source = Path(unquote(parsed.path)) if parsed.scheme == 'file' else config_path.parent / unquote(item['rootUri'])
+        try:
+            resolved = source.resolve(strict=True)
+            resolved.relative_to(tree)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f'FlutterTools package root escapes or is missing from the packaged tree: {item["rootUri"]}') from exc
+        if not resolved.is_dir():
+            raise RuntimeError(f'FlutterTools package root is not a directory: {resolved}')
+        relative = os.path.relpath(resolved, config_path.parent)
+        item['rootUri'] = quote(relative, safe='/.-_~') + '/'
+    payload = (json.dumps(config, indent=2, ensure_ascii=False) + '\n').encode('utf-8')
+    if config_path.read_bytes() == payload:
+        return
+    fd, temporary_name = tempfile.mkstemp(prefix=config_path.name + '.normalized-', dir=config_path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        shutil.copystat(config_path, temporary, follow_symlinks=False)
+        os.replace(temporary, config_path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 class GitProgress(git.RemoteProgress):
@@ -366,7 +502,11 @@ class Build:
         self.ndk = ndk
         self.tag = tag
         self.release_tag = release_tag
-        revision = str(cfg.get('flutter', {}).get('revision', '0'))
+        # Debian revisions make same-upstream-version installer fixes upgradeable.
+        # The source tree's legacy revision=0 means the first Debian revision.
+        revision = str(cfg.get('flutter', {}).get('revision', '1'))
+        if revision == '0':
+            revision = '1'
         self.revision = revision
         self.package_version = f"{tag}-{revision}" if revision != '0' else tag
         self.dart_version = dart_version
@@ -1017,7 +1157,8 @@ class Build:
             return False
 
         if config.is_file() and not package_config_uris_outside_tree(config, tree):
-            logger.info('flutter_tools packages already resolved inside the tree, skipping pub get.')
+            normalize_flutter_tools_package_config(config, tree)
+            logger.info('flutter_tools package config is contained and relocatable; skipping pub get.')
             return True
 
         dart_bin = self._host_dart_bin()
@@ -1044,7 +1185,9 @@ class Build:
                 shutil.rmtree(pub_cache, ignore_errors=True)
             return False
 
-        logger.success('Pre-resolved flutter_tools packages inside the tree (install-time pub get avoided).')
+        normalize_flutter_tools_package_config(config, tree)
+
+        logger.success('Pre-resolved flutter_tools packages inside the tree with relocatable roots (install-time pub get avoided).')
         return True
 
     def sync(self, *, cfg: str = None, root: str = None):

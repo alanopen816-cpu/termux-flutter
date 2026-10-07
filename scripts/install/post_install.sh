@@ -13,6 +13,22 @@ PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 FLUTTER_ROOT="${FLUTTER_ROOT:-$PREFIX/opt/flutter}"
 ANDROID_SDK="${ANDROID_SDK:-$PREFIX/opt/android-sdk}"
 DART_SDK="${DART_SDK:-$FLUTTER_ROOT/bin/cache/dart-sdk}"
+if [ "${1:-}" = "--package-bootstrap" ]; then
+    INSTALL_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    PACKAGE_BOOTSTRAP="$INSTALL_SCRIPT_DIR/flutter_package_bootstrap.py"
+    PYTHON="$PREFIX/bin/python"
+    if [ ! -x "$PYTHON" ]; then
+        echo "❌ Required Termux Python is missing: $PYTHON" >&2
+        exit 1
+    fi
+    if [ ! -f "$PACKAGE_BOOTSTRAP" ]; then
+        echo "❌ Required Flutter package bootstrap helper is missing: $PACKAGE_BOOTSTRAP" >&2
+        exit 1
+    fi
+    exec "$PYTHON" "$PACKAGE_BOOTSTRAP" \
+        --prefix "$PREFIX" --home "${HOME:?HOME is not set}" \
+        --flutter-root "$FLUTTER_ROOT" --android-sdk "$ANDROID_SDK"
+fi
 if [ -z "${FLUTTER_PREBUILT_ENGINE_VERSION:-}" ] && [ -f "$FLUTTER_ROOT/bin/internal/engine.version" ]; then
     export FLUTTER_PREBUILT_ENGINE_VERSION="$(cat "$FLUTTER_ROOT/bin/internal/engine.version" 2>/dev/null | tr -d '\n\r')"
 fi
