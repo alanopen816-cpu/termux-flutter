@@ -117,14 +117,14 @@ def test_deb_identity_reads_real_dpkg_control_fields(tmp_path):
     control = package / "DEBIAN/control"
     control.parent.mkdir(parents=True)
     control.parent.chmod(0o755)
-    control.write_text("Package: flutter\nVersion: 3.47.2-2\nArchitecture: all\nMaintainer: test\nDescription: fixture\n")
+    control.write_text("Package: flutter\nVersion: 3.47.2-3\nArchitecture: all\nMaintainer: test\nDescription: fixture\n")
     deb = tmp_path / "fixture.deb"
     subprocess.run(["dpkg-deb", "--build", str(package), str(deb)], check=True, capture_output=True, text=True)
 
     labelled = subprocess.run(["dpkg-deb", "-f", str(deb), "Package", "Version", "Architecture"],
                               check=True, capture_output=True, text=True).stdout.splitlines()
-    assert labelled == ["Package: flutter", "Version: 3.47.2-2", "Architecture: all"]
-    assert repack.read_deb_identity(deb) == ("flutter", "3.47.2-2", "all")
+    assert labelled == ["Package: flutter", "Version: 3.47.2-3", "Architecture: all"]
+    assert repack.read_deb_identity(deb) == ("flutter", "3.47.2-3", "all")
 
 
 def test_engine_json_must_match_archived_revision_and_have_required_fields(tmp_path):
@@ -233,8 +233,8 @@ def test_precompression_manifest_requires_every_package_member_route(tmp_path):
     shutil.copytree(git_cache, root / ".git", dirs_exist_ok=True)
 
     generic = package_builder.Package(
-        root=root, arch="arm64", tag="3.47.2", revision="2",
-        control={"Package": "flutter", "Version": "3.47.2-2", "Architecture": "aarch64",
+        root=root, arch="arm64", tag="3.47.2", revision="3",
+        control={"Package": "flutter", "Version": "3.47.2-3", "Architecture": "aarch64",
                  "Maintainer": "test", "Description": "test"},
         resource={"flutter": {"source": str(root), "output": str(repack.FLUTTER_RELATIVE)}},
         maintainer_scripts={"postinst": root.parent / "postinst"},
@@ -512,7 +512,7 @@ def test_provenance_includes_compiled_snapshot_and_reused_engine(tmp_path):
     data = {
         "source_archive_sha256": repack.SOURCE_SHA256,
         "flutter_version": "3.47.2",
-        "package_version": "3.47.2-2",
+        "package_version": "3.47.2-3",
         "engine_revision": "a" * 40,
         "engine_reused": True,
         "snapshot_sha256": hashlib.sha256(b"kernel").hexdigest(),
@@ -584,9 +584,13 @@ def test_compile_or_launcher_load_failure_fails_closed(tmp_path, compile_mode, l
 
 
 def test_repack_tracks_termux_gradle_wrapper_patch_and_debian_revision():
-    assert repack.PACKAGE_VERSION == "3.47.2-2"
+    assert repack.PACKAGE_VERSION == "3.47.2-3"
     assert repack.FLUTTER_VERSION == "3.47.2"
     assert (
         "patch_gradle_wrapper",
         "packages/flutter_tools/lib/src/android/gradle_utils.dart",
+    ) in repack.PATCH_FUNCTIONS
+    assert (
+        "patch_create_gradle_wrapper",
+        "packages/flutter_tools/lib/src/commands/create_base.dart",
     ) in repack.PATCH_FUNCTIONS

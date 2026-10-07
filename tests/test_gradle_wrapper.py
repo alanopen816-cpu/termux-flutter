@@ -27,6 +27,13 @@ def _patch_fixture(tmp_path):
     target = tmp_path / "gradle_utils.dart"
     target.write_text(
         "class GradleUtils {\n"
+        "  String getExecutable(FlutterProject project) {\n"
+        "    if (gradle.existsSync()) {\n"
+        "      _operatingSystemUtils.makeExecutable(gradle);\n"
+        "      return gradle.path;\n"
+        "    }\n"
+        "    return '';\n"
+        "  }\n"
         "  void injectGradleWrapperIfNeeded() {\n"
         "    onFileCopied: (File source, File dest) {\n"
         "        _operatingSystemUtils.makeExecutable(dest);\n"
@@ -35,6 +42,17 @@ def _patch_fixture(tmp_path):
         "}\n"
     )
     return target, _apply_patch(target, tmp_path / "env")
+
+
+def _apply_create_base_patch(target, state_root):
+    env = isolated_user_env(state_root)
+    env.update({"TARGET": str(target), "POST_INSTALL_SCRIPT": str(POST_INSTALL)})
+    return subprocess.run(
+        ["bash", "-c", 'source "$POST_INSTALL_SCRIPT" --lib && patch_create_gradle_wrapper "$TARGET"'],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _extract_dart_function(source, signature):
@@ -55,15 +73,44 @@ def test_installer_and_repacker_patch_new_gradle_wrapper_source(tmp_path):
     target, result = _patch_fixture(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     patched = target.read_text()
-    assert "void _termuxNormalizeGradleWrapper(File file, Platform platform)" in patched
-    assert "_termuxNormalizeGradleWrapper(dest, _platform);" in patched
+    assert "void termuxNormalizeGradleWrapper(File file, Platform platform)" in patched
+    assert "termuxNormalizeGradleWrapper(dest, _platform);" in patched
+    assert "termuxNormalizeGradleWrapper(gradle, _platform);" in patched
     assert "TERMUX_VERSION" in patched
     assert "file.parent.createTempSync('.termux-gradlew-')" in patched
     assert "renameSync(file.path)" in patched
     assert "File('${file.path}" not in patched
+    assert "termuxNormalizeGradleWrapper(gradle, _platform);" in patched
+    assert '"patch_create_gradle_wrapper", "packages/flutter_tools/lib/src/commands/create_base.dart"' in REPACK.read_text()
     before = target.read_bytes()
     result = _apply_patch(target, tmp_path / "env-repeat")
     assert result.returncode == 0, result.stdout + result.stderr
+    assert target.read_bytes() == before
+
+
+def test_flutter_create_wrapper_copy_uses_termux_normalizer(tmp_path):
+    target = tmp_path / "create_base.dart"
+    target.write_text(
+        "import '../android/gradle_utils.dart' as gradle;\n"
+        "class CreateBase {\n"
+        "  int _injectGradleWrapper(Project project) {\n"
+        "    copyDirectory(artifact, project, onFileCopied: (File sourceFile, File destinationFile) {\n"
+        "      final String modes = sourceFile.statSync().modeString();\n"
+        "      if (modes.contains('x')) {\n"
+        "        globals.os.makeExecutable(destinationFile);\n"
+        "      }\n"
+        "    });\n"
+        "    return 0;\n"
+        "  }\n"
+        "}\n"
+    )
+    result = _apply_create_base_patch(target, tmp_path / "create-env")
+    assert result.returncode == 0, result.stdout + result.stderr
+    patched = target.read_text()
+    assert "gradle.termuxNormalizeGradleWrapper(destinationFile, globals.platform);" in patched
+    before = target.read_bytes()
+    repeated = _apply_create_base_patch(target, tmp_path / "create-env-repeat")
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
     assert target.read_bytes() == before
     repack_source = REPACK.read_text()
     assert '("patch_gradle_wrapper", "packages/flutter_tools/lib/src/android/gradle_utils.dart")' in repack_source
@@ -85,6 +132,25 @@ def test_gradle_wrapper_patch_rejects_unknown_layout_without_rewriting(tmp_path)
     assert target.read_bytes() == original
 
 
+def test_gradle_wrapper_patch_upgrades_legacy_postimage_for_existing_wrappers(tmp_path):
+    target, result = _patch_fixture(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    legacy = target.read_text().replace("termuxNormalizeGradleWrapper", "_termuxNormalizeGradleWrapper")
+    legacy = legacy.replace("      _termuxNormalizeGradleWrapper(gradle, _platform);\n", "")
+    target.write_text(legacy)
+
+    result = _apply_patch(target, tmp_path / "legacy-upgrade")
+    assert result.returncode == 0, result.stdout + result.stderr
+    upgraded = target.read_text()
+    assert "void termuxNormalizeGradleWrapper(File file, Platform platform)" in upgraded
+    assert "termuxNormalizeGradleWrapper(gradle, _platform);" in upgraded
+    assert "termuxNormalizeGradleWrapper(dest, _platform);" in upgraded
+    before = target.read_bytes()
+    repeated = _apply_patch(target, tmp_path / "legacy-upgrade-repeat")
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
+    assert target.read_bytes() == before
+
+
 def test_wrapper_helper_preserves_custom_and_non_termux_wrappers_and_rejects_malformed(tmp_path):
     dartvm = os.environ.get("DARTVM") or shutil.which("dartvm")
     if not dartvm:
@@ -92,7 +158,7 @@ def test_wrapper_helper_preserves_custom_and_non_termux_wrappers_and_rejects_mal
     target, result = _patch_fixture(tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     helper = _extract_dart_function(
-        target.read_text(), "void _termuxNormalizeGradleWrapper(File file, Platform platform)"
+        target.read_text(), "void termuxNormalizeGradleWrapper(File file, Platform platform)"
     )
     # This fixture models package:file's abstract File/Directory interfaces. Using
     # dart:io File as the helper's File type would miss the real compile failure.
@@ -153,7 +219,7 @@ class Platform { Platform(this.isLinux, this.environment); final bool isLinux; f
             + f"  LocalFile.failWrite = {str(failure == 'write').lower()};\n"
             + f"  LocalFile.failRename = {str(failure == 'rename').lower()};\n"
             + f"  final File file = LocalFile(io.File({__import__('json').dumps(str(wrapper))}));\n"
-            + f"  _termuxNormalizeGradleWrapper(file, Platform({str(linux).lower()}, {environment!r}));\n"
+            + f"  termuxNormalizeGradleWrapper(file, Platform({str(linux).lower()}, {environment!r}));\n"
             + "}\n"
         )
         env = isolated_user_env(tmp_path / "runtime-env")

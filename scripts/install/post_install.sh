@@ -666,12 +666,10 @@ try:
     source = original.decode("utf-8")
 except UnicodeDecodeError as error:
     raise SystemExit(f"gradle_wrapper: source is not UTF-8: {error}")
-marker = "void _termuxNormalizeGradleWrapper(File file, Platform platform) {"
-call = "        _termuxNormalizeGradleWrapper(dest, _platform);\n"
-if marker in source:
-    if source.count(marker) != 1 or source.count(call) != 1:
-        raise SystemExit("gradle_wrapper: incomplete or ambiguous existing patch")
-    raise SystemExit(0)
+private_marker = "void _termuxNormalizeGradleWrapper(File file, Platform platform) {"
+marker = "void termuxNormalizeGradleWrapper(File file, Platform platform) {"
+copy_call = "        termuxNormalizeGradleWrapper(dest, _platform);\n"
+existing_call = "      termuxNormalizeGradleWrapper(gradle, _platform);\n"
 helper = '''void _termuxNormalizeGradleWrapper(File file, Platform platform) {
   if (!platform.isLinux || !platform.environment.containsKey('TERMUX_VERSION')) {
     return;
@@ -718,10 +716,29 @@ helper = '''void _termuxNormalizeGradleWrapper(File file, Platform platform) {
 '''
 class_marker = "class GradleUtils {"
 copy_marker = "        _operatingSystemUtils.makeExecutable(dest);\n"
-if source.count(class_marker) != 1 or source.count(copy_marker) != 1:
+get_executable_marker = "      _operatingSystemUtils.makeExecutable(gradle);\n"
+if source.count(class_marker) != 1 or source.count(copy_marker) != 1 or source.count(get_executable_marker) != 1:
     raise SystemExit("gradle_wrapper: unsupported GradleUtils source layout")
-patched = source.replace(class_marker, helper + class_marker, 1)
-patched = patched.replace(copy_marker, call + copy_marker, 1)
+if private_marker in source:
+    if source.count(private_marker) != 1:
+        raise SystemExit("gradle_wrapper: ambiguous legacy helper")
+    source = source.replace("_termuxNormalizeGradleWrapper", "termuxNormalizeGradleWrapper")
+if marker not in source:
+    helper = helper.replace("_termuxNormalizeGradleWrapper", "termuxNormalizeGradleWrapper")
+    source = source.replace(class_marker, helper + class_marker, 1)
+elif source.count(marker) != 1:
+    raise SystemExit("gradle_wrapper: ambiguous helper")
+if source.count(copy_call) == 0:
+    source = source.replace(copy_marker, copy_call + copy_marker, 1)
+elif source.count(copy_call) != 1:
+    raise SystemExit("gradle_wrapper: ambiguous cache-copy call")
+if source.count(existing_call) == 0:
+    source = source.replace(get_executable_marker, existing_call + get_executable_marker, 1)
+elif source.count(existing_call) != 1:
+    raise SystemExit("gradle_wrapper: ambiguous existing-wrapper call")
+if source.count(marker) != 1 or source.count(copy_call) != 1 or source.count(existing_call) != 1:
+    raise SystemExit("gradle_wrapper: failed to install all normalization call sites")
+patched = source
 fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 try:
     with os.fdopen(fd, "wb") as stream:
@@ -739,6 +756,50 @@ except BaseException:
 PY
 }
 register_patch "gradle_wrapper" "$FLUTTER_ROOT/packages/flutter_tools/lib/src/android/gradle_utils.dart" patch_gradle_wrapper
+
+patch_create_gradle_wrapper() {
+    python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+original = path.read_bytes()
+try:
+    source = original.decode("utf-8")
+except UnicodeDecodeError as error:
+    raise SystemExit(f"create_gradle_wrapper: source is not UTF-8: {error}")
+import_marker = "import '../android/gradle_utils.dart' as gradle;"
+copy_marker = "        globals.os.makeExecutable(destinationFile);\n"
+call = "        gradle.termuxNormalizeGradleWrapper(destinationFile, globals.platform);\n"
+if source.count(import_marker) != 1:
+    raise SystemExit("create_gradle_wrapper: expected GradleUtils import was not found")
+if source.count(copy_marker) != 1:
+    raise SystemExit("create_gradle_wrapper: unsupported create_base wrapper-copy layout")
+if source.count(call) == 1:
+    raise SystemExit(0)
+if source.count(call) != 0:
+    raise SystemExit("create_gradle_wrapper: ambiguous existing normalization call")
+patched = source.replace(copy_marker, call + copy_marker, 1)
+fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(patched.encode("utf-8"))
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary_name, stat.S_IMODE(path.stat().st_mode))
+    os.replace(temporary_name, path)
+except BaseException:
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+}
+register_patch "create_gradle_wrapper" "$FLUTTER_ROOT/packages/flutter_tools/lib/src/commands/create_base.dart" patch_create_gradle_wrapper
 
 patch_cmake_lists() {
     if grep -F -q "FlutterNDKTrick" "$1"; then return 0; fi
