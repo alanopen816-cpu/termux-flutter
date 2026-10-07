@@ -65,21 +65,30 @@ This repository packages a Flutter SDK for Termux ARM64:
 | Dart | `3.13.2` |
 | Architecture | `aarch64` / `arm64-v8a` |
 | Release asset | [`flutter_3.47.2_aarch64.deb`](https://github.com/ImL1s/termux-flutter-wsl/releases/tag/v3.47.2-termux) |
-| Size | Pending first 3.47.2 build |
-| SHA256 | Published with the `.deb.sha256` companion asset |
+| Debian package revision | `3.47.2-4` (Flutter remains `3.47.2`) |
+| Validated package | `artifacts/install-ready-r4/flutter_3.47.2_aarch64.deb` |
+| Package size | 214,412,776 bytes |
+| Package SHA256 | `e6801a4ae87bacb439c7e3afb7402020d703d637dc8b1bd31e72c5b2b2a34a6a` |
+| Release APK smoke size | 17,633,782 bytes (about 16.82 MiB) |
+| Stripped `libflutter.so` | 11,747,864 bytes (about 11.20 MiB) |
 
 ### Device smoke test
 
-Last full device validation: **2026-08-23**, Samsung SM-X716B / Android 16 / Termux.
+Device runtime validation on Samsung SM-X716B / Android 16 / Termux was reported
+for the reduced release APK. The report confirms installation, launch, rendered
+Flutter UI, interaction, a live process, and background/foreground operation.
+The `libdolphin.so` warning was non-fatal; no app crash, linker, JNI, or missing
+Flutter symbol error was reported. Treat this as device evidence for the tested
+APK, not a guarantee for every plugin or device.
 
 | Check | Result |
 | --- | --- |
 | `dpkg -i` + `post_install.sh` | ✅ |
 | `flutter --version` / `dart --version` / `dartvm --version` | ✅ |
 | `flutter doctor -v` | ✅ expected channel/device warnings only |
-| `flutter create --platforms=android,linux` | ✅ |
-| `flutter build apk --release --target-platform android-arm64` | ✅ |
-| `flutter build linux --release` | ✅ |
+| `flutter create` / `flutter analyze` | ✅ |
+| Android ARM64 debug and release APK builds | ✅ |
+| `adb install`, launch, UI and runtime | ✅ (reported for reduced release APK) |
 
 ## Quick install
 
@@ -88,81 +97,47 @@ Last full device validation: **2026-08-23**, Samsung SM-X716B / Android 16 / Ter
 | Item | Requirement |
 | --- | --- |
 | Device | Android ARM64 / aarch64 |
-| Android | Android 11+ recommended |
-| App | F-Droid Termux; Termux:X11 for Linux GUI |
-| Storage | At least 8GB free space recommended |
+| Android | ARM64 Android device; Android 11+ recommended |
+| App | Termux with `dpkg`; Termux:X11 only for Linux desktop GUI |
+| Android SDK | Existing SDK at `$PREFIX/opt/android-sdk`, API 34 platform, licenses, build-tools and platform-tools |
+| Storage | At least 8GB free space recommended; larger projects/build caches need more |
+| Memory | Builds are resource intensive; close other workloads if Gradle/Dart is killed |
 
-### One-click install (recommended)
-
-```bash
-pkg update && pkg upgrade -y
-pkg install -y curl
-curl -L https://raw.githubusercontent.com/ImL1s/termux-flutter-wsl/master/install_flutter_complete.sh -o install_flutter_complete.sh
-bash install_flutter_complete.sh
-```
-
-### Manual release `.deb` install
+### Install the package
 
 ```bash
-pkg update && pkg install -y wget
-wget https://github.com/ImL1s/termux-flutter-wsl/releases/download/v3.47.2-termux/flutter_3.47.2_aarch64.deb
-sha256sum flutter_3.47.2_aarch64.deb
-
-dpkg -i flutter_3.47.2_aarch64.deb
-apt --fix-broken install -y
-bash $PREFIX/share/flutter/post_install.sh
-source ~/.bashrc
+dpkg -i /path/to/flutter_3.47.2_aarch64.deb
 flutter --version
+flutter doctor -v
 ```
 
-Before installing, verify the SHA256 against the release's `.deb.sha256` companion asset.
+Verify the package SHA256 against its trusted release checksum before installation.
+The tested installation path is `dpkg -i`; an earlier `pkg`/APT attempt failed
+inside Termux package management before unpacking and is not evidence of a `.deb`
+failure. Do not run `apt -f install` unless APT reports an actual dependency issue.
 
 ## Create a project and build an APK
 
-This project supports two different compilation modes:
+Create and validate a new Android project using the package-managed Termux
+configuration. APK builds target ARM64; use Android API 34 for compatibility
+with the native Termux AAPT2 toolchain.
 
-### Mode A: Verified Termux Local APK Build (Recommended Default)
-This is the most stable path for local developer testing, side-loading, and fast iterations.
-
-1. Configure the project to override AAPT2, disable resource optimizations, and disable shrinking:
-```properties
-# android/gradle.properties
-android.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2
-android.enableResourceOptimizations=false
-shrink=false
-```
-
-2. Pin the compilation SDK target to API 34 and explicitly disable code shrinking:
-```kotlin
-// android/app/build.gradle.kts
-android {
-    compileSdk = 34
-
-    defaultConfig {
-        targetSdk = 34
-        ndk { abiFilters += listOf("arm64-v8a") }
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-            isShrinkResources = false
-        }
-    }
-}
-```
-
-3. Run the release build command (bypassing JIT Dart icon tree-shaking limits):
 ```bash
-flutter build apk --release --target-platform android-arm64 --no-tree-shake-icons
+flutter create my_app
+cd my_app
+flutter pub get
+flutter analyze
+flutter build apk --debug --target-platform android-arm64
+flutter build apk --release --target-platform android-arm64
+adb install -r build/app/outputs/flutter-apk/app-release.apk
+adb shell monkey -p <application-id> 1
 ```
 
----
-
-### Mode B: Experimental Google Play Publish Toolchain (API 35+ / AAB)
-This mode is **experimental**. Google Play requires new uploads to target Android 15 (API 35) or newer, which causes the default Termux `aapt2` package to crash. This mode requires installing native static ARM64 Android Build-Tools (see [AAPT2_RELEASE_BUILD_BUG_ANALYSIS.md](docs/guides/AAPT2_RELEASE_BUILD_BUG_ANALYSIS.md) for details).
-
-> `post_install.sh` patches Flutter Tools defaults for Termux, but keeping the project-level Gradle settings above makes different templates and plugins more predictable.
+Replace `<application-id>` with the Android application ID from the project.
+The reduced release APK was reported to launch and render on a real Android
+device. ADB should resolve to Termux's `$PREFIX/bin/adb`; if the legacy SDK's
+ADB remains in a user's shell PATH, Flutter may still warn about duplicate
+executables even though the native one is selected first.
 
 ## Linux desktop / Termux:X11
 
@@ -175,6 +150,12 @@ flutter create --platforms=linux linux_demo
 cd linux_demo
 flutter run -d linux
 ```
+
+Linux desktop builds are experimental and require Termux:X11; they are not part
+of the Android ARM64 support guarantee. iOS is not supported. Linux x86-64 host
+Flutter/Dart/engine binaries are incompatible with the Android/Termux ARM64 host.
+The package does not bundle an Android SDK; use the existing canonical SDK at
+`$PREFIX/opt/android-sdk`.
 
 You can also build only:
 
@@ -256,7 +237,9 @@ termux-flutter-wsl/
 
 - The supported target is **ARM64 / arm64-v8a**. 32-bit ARM and x64 Android gen_snapshot builds are out of scope.
 - Android APK builds should use `compileSdk = 34` / `targetSdk = 34` to avoid Termux `aapt2` compatibility problems with newer `android.jar` files.
-- `flutter doctor` reports custom channel / upstream remote warnings for the packaged SDK. These are expected and do not mean the smoke test failed.
+- `flutter doctor` can show a framework-age warning because the package uses deterministic synthetic Git metadata dated `2000-01-01`; changing this risks reproducibility and version/stamp behavior, so it is documented rather than falsified.
+- A prior APT attempt stopped before unpacking with a Termux `fdsan` file-descriptor error. This is separate from the validated `dpkg -i` package installation; no APT workaround is claimed.
+- Android SDK and ADB configuration is package-managed where possible. Existing user shell startup files can still append a legacy SDK path; the package does not delete that SDK or user data.
 - `ninja flutter` does not produce a usable `dart` binary; source builds must run `build_dart()` separately.
 - The release `.deb` is large, so install and first `post_install.sh` runs can take time.
 
