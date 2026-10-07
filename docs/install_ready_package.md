@@ -54,9 +54,15 @@ byte hash before publishing the output without overwriting an existing file. Cur
 package.yaml resources, wrappers, profile, postinst and configuration helpers are
 applied. Since the general package walker intentionally skips directories named
 `engine`, the repacker explicitly maps the archived `bin/cache/artifacts/engine`
-runtime subtree to its matching prefix-relative SDK destination. A pre-compression
-manifest check rejects any package resource set that omits or changes staged ELF
-bytes; the final extracted `.deb` is checked independently as well. The provenance file records the input archive, workspace commit, reused
+runtime subtree to its matching prefix-relative SDK destination. Before compression,
+the repacker verifies that every file and directory under every resolved package
+root is routed, hashes the complete package-root file set into a compact provenance
+manifest, and checks the required tool inputs, installer scripts, and native ELF
+inventory. The final validator normalizes only the known Termux install prefix
+(`data/data/com.termux/files/usr/`) to SDK-logical paths; it also accepts bare logical
+paths in fixtures, rejects duplicate aliases and path escapes, and still requires the
+mandatory files at their exact logical destinations. The extracted `.deb` is checked
+independently as well. The provenance file records the input archive, workspace commit, reused
 engine revision, Dart compiler, generated kernel hash, synthetic commit, and ELF
 inventory.
 

@@ -217,6 +217,20 @@ def _ar_members(path):
             yield name, data
 
 
+def _normalize_deb_payload_path(name):
+    """Return a safe SDK-logical path for Termux-prefixed or bare fixture members."""
+    normalized = posixpath.normpath(str(name))
+    if normalized in ("", "."):
+        return None
+    if (normalized.startswith("/") or normalized == ".."
+            or normalized.startswith("../")):
+        raise ValueError(f"unsafe path in deb data archive: {name}")
+    termux_prefix = "data/data/com.termux/files/usr/"
+    if normalized.startswith(termux_prefix):
+        normalized = normalized[len(termux_prefix):]
+    return normalized
+
+
 def validate_deb_artifacts(path):
     """Fail packaging when native runtimes, real FlutterTools inputs, or postinst are absent."""
     data_member = None
@@ -232,14 +246,19 @@ def validate_deb_artifacts(path):
         raise ValueError(f'control archive not found in deb: "{path}"')
 
     found = {}
+    archive_names = set()
     with tarfile.open(fileobj=io.BytesIO(data_member), mode='r:*') as data_tar:
         for member in data_tar:
+            name = _normalize_deb_payload_path(member.name)
+            if name is None:
+                continue
+            if name in archive_names:
+                raise RuntimeError(f"deb data archive has ambiguous duplicate archive path: {name}")
+            archive_names.add(name)
             if not member.isfile():
                 continue
-            name = member.name.lstrip('./')
-            for suffix in REQUIRED_DEB_ARTIFACTS:
-                if name.endswith(suffix):
-                    found[suffix] = member
+            if name in REQUIRED_DEB_ARTIFACTS:
+                found[name] = member
 
     missing = [it for it in REQUIRED_DEB_ARTIFACTS if it not in found]
     if missing:
@@ -268,7 +287,6 @@ def validate_deb_artifacts(path):
 
     payloads = {}
     with tarfile.open(fileobj=io.BytesIO(data_member), mode='r:*') as data_tar:
-        archive_names = {member.name.lstrip('./') for member in data_tar}
         for suffix in REQUIRED_DEB_TOOL_ARTIFACTS:
             member = found[suffix]
             stream = data_tar.extractfile(member)

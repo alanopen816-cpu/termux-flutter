@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -202,6 +203,71 @@ def test_repack_resources_preserve_full_engine_cache_native_inventory(tmp_path):
     }
     assert expected_outputs <= outputs, "resource filtering dropped cached release/profile engine payload"
     assert repack.validate_package_native_inventory(package, root) == repack.native_inventory(root)
+
+
+def test_precompression_manifest_requires_every_package_member_route(tmp_path):
+    import build
+    import package as package_builder
+
+    root = tmp_path / "flutter"
+    flutter_tools = root / "packages/flutter_tools"
+    (flutter_tools / ".dart_tool").mkdir(parents=True)
+    (flutter_tools / "pubspec.yaml").write_text("name: flutter_tools\n")
+    pub_cache_root = root / ".pub-cache/hosted/pub.dev/example-1.0.0"
+    (pub_cache_root / "lib/src").mkdir(parents=True)
+    (pub_cache_root / "lib/src/example.dart").write_text("// package source")
+    roots = [flutter_tools, pub_cache_root]
+    for relative in build.REQUIRED_DEB_TOOL_ARTIFACTS:
+        path = root / relative.removeprefix("opt/flutter/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(b"required payload")
+    git_cache = root / "bin/cache/flutter_tools_git"
+    (git_cache / "refs/heads").mkdir(parents=True)
+    (git_cache / "HEAD").write_text("ref: refs/heads/stable\n")
+    (git_cache / "refs/heads/stable").write_text("a" * 40 + "\n")
+    (git_cache / "termux_synthetic").write_text("fixture\n")
+    shutil.copytree(git_cache, root / ".git", dirs_exist_ok=True)
+
+    generic = package_builder.Package(
+        root=root, arch="arm64", tag="3.47.2", revision="1",
+        control={"Package": "flutter", "Version": "3.47.2-1", "Architecture": "aarch64",
+                 "Maintainer": "test", "Description": "test"},
+        resource={"flutter": {"source": str(root), "output": str(repack.FLUTTER_RELATIVE)}},
+        maintainer_scripts={"postinst": root.parent / "postinst"},
+    )
+    (root.parent / "postinst").write_text("#!/bin/sh\nexit 0\n")
+    (root.parent / "postinst").chmod(0o755)
+
+    class FixtureRoutes:
+        omit_pub_cache = False
+
+        def gen_resource(self, _names):
+            for item in generic.gen_resource("flutter"):
+                if self.omit_pub_cache and ".pub-cache/" in str(item["out"]):
+                    continue
+                yield item
+            for item in generic.gen_resource("flutter"):
+                source = item.get("src")
+                if isinstance(source, Path) and "bin/cache/flutter_tools_git/" in str(source):
+                    relative = source.relative_to(git_cache)
+                    yield {"out": repack.FLUTTER_RELATIVE / ".git" / relative, "src": source}
+            for suffix in build.REQUIRED_DEB_INSTALLER_ARTIFACTS:
+                yield {"out": repack.PREFIX_RELATIVE / suffix, "src": b"#!/bin/sh\n",
+                       "mod": 0o755}
+
+        def gen_control_files(self):
+            return generic.gen_control_files()
+
+    routes = FixtureRoutes()
+    manifest = repack.validate_package_payload_routes(routes, root, roots)
+    assert manifest["package_root_count"] == 2
+    assert manifest["package_root_file_count"] >= 4
+    assert len(manifest["package_root_members_sha256"]) == 64
+
+    routes.omit_pub_cache = True
+    with pytest.raises(repack.RepackError, match="package payload route is missing"):
+        repack.validate_package_payload_routes(routes, root, roots)
 
 
 def test_resource_overlay_targets_payload_root_not_working_directory(tmp_path):

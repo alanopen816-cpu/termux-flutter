@@ -355,7 +355,7 @@ def _package_object(root: Path, repo_root: Path, package_yaml: dict):
 
 
 def validate_package_native_inventory(package, flutter_root: Path,
-                                       expected_inventory: dict[str, str] | None = None) -> dict[str, str]:
+                                      expected_inventory: dict[str, str] | None = None) -> dict[str, str]:
     """Fail before compression unless selected resource routes preserve every staged ELF byte."""
     flutter_root = Path(flutter_root)
     expected = expected_inventory if expected_inventory is not None else native_inventory(flutter_root)
@@ -396,6 +396,97 @@ def validate_package_native_inventory(package, flutter_root: Path,
         raise RepackError("selected package resources do not preserve staged native ELF inventory: "
                           + "; ".join(details))
     return packaged
+
+
+def validate_package_payload_routes(package, flutter_root: Path,
+                                    package_roots: list[Path]) -> dict:
+    """Preflight every resolved package member and mandatory non-ELF resource route."""
+    import build
+
+    flutter_root = Path(flutter_root).resolve(strict=True)
+    routes: dict[str, Path | None] = {}
+    resource_items = list(package.gen_resource(list(PUBLISHED_RESOURCES)))
+    for item in resource_items:
+        destination = Path(item["out"])
+        try:
+            relative = destination.relative_to(FLUTTER_RELATIVE).as_posix()
+        except ValueError:
+            continue
+        source = item.get("src")
+        routes[relative] = source if isinstance(source, Path) else None
+
+    members: dict[str, str] = {}
+    for package_root in package_roots:
+        package_root = Path(package_root).resolve(strict=True)
+        try:
+            package_root.relative_to(flutter_root)
+        except ValueError as exc:
+            raise RepackError(f"package root escapes the staged Flutter SDK: {package_root}") from exc
+        for source in (package_root, *package_root.rglob("*")):
+            if source.is_symlink():
+                try:
+                    source.resolve(strict=True).relative_to(flutter_root)
+                except (OSError, ValueError) as exc:
+                    raise RepackError(f"package member symlink escapes or is missing: {source}") from exc
+            relative = source.relative_to(flutter_root).as_posix()
+            routed_source = routes.get(relative)
+            if routed_source is None or routed_source != source:
+                raise RepackError(f"package payload route is missing or mismatched: {relative}")
+            if source.is_file():
+                members[relative] = sha256_file(source)
+
+    required_sdk_paths = [
+        suffix.removeprefix("opt/flutter/")
+        for suffix in build.REQUIRED_DEB_TOOL_ARTIFACTS
+        if suffix.startswith("opt/flutter/")
+    ]
+    for relative in required_sdk_paths:
+        source = flutter_root / relative
+        routed_source = routes.get(relative)
+        if (not source.is_file() or not isinstance(routed_source, Path)
+                or not routed_source.is_file()
+                or sha256_file(source) != sha256_file(routed_source)):
+            raise RepackError(f"required FlutterTools input is not routed into the deb: {relative}")
+
+    required_outputs = {(PREFIX_RELATIVE / suffix).as_posix()
+                        for suffix in build.REQUIRED_DEB_INSTALLER_ARTIFACTS}
+    output_items = {Path(item["out"]).as_posix(): item for item in resource_items}
+    output_routes = set(output_items)
+    missing_outputs = sorted(required_outputs - output_routes)
+    if missing_outputs:
+        raise RepackError("required installer resources are not routed into the deb: "
+                          + ", ".join(missing_outputs))
+    for output in sorted(required_outputs):
+        item = output_items[output]
+        source, mode = item.get("src"), item.get("mod")
+        executable = (mode & 0o111) if isinstance(mode, int) else (
+            source.stat().st_mode & 0o111 if isinstance(source, Path) and source.is_file() else 0)
+        if (isinstance(source, bytes) and not source) or not isinstance(source, (bytes, Path)):
+            raise RepackError(f"required installer resource has no file payload: {output}")
+        if isinstance(source, Path) and not source.is_file():
+            raise RepackError(f"required installer resource source is missing: {source}")
+        if executable == 0:
+            raise RepackError(f"required installer resource is not executable: {output}")
+
+    control_items = list(package.gen_control_files())
+    scripts = {item.get("out"): item for item in control_items if item.get("out") != "control"}
+    postinst = scripts.get("postinst")
+    if (postinst is None or not isinstance(postinst.get("src"), bytes)
+            or not postinst["src"].startswith(b"#!")
+            or not isinstance(postinst.get("mod"), int) or postinst["mod"] & 0o111 == 0):
+        raise RepackError("package control metadata does not provide an executable postinst")
+
+    manifest_digest = hashlib.sha256(json.dumps(members, sort_keys=True, separators=(",", ":"))
+                                     .encode("utf-8")).hexdigest()
+    return {
+        "package_root_count": len(package_roots),
+        "package_root_file_count": len(members),
+        "package_root_members_sha256": manifest_digest,
+        "required_tool_input_count": len(required_sdk_paths),
+        "required_installer_output_count": len(required_outputs),
+        "control_file_count": len(control_items),
+        "maintainer_script_count": len(scripts),
+    }
 
 
 def _apply_overlay(payload_root: Path, items: list[dict]) -> None:
@@ -648,7 +739,6 @@ def repack(source: Path, output: Path, *, engine_stamp_json: Path | None = None,
         if not pubspec.is_file() or not lock.is_file() or pubspec.stat().st_mtime_ns > lock.stat().st_mtime_ns:
             raise RepackError("archived FlutterTools pubspec.lock is missing or stale; refusing network resolution")
         package_roots = normalize_package_config(root, package_config)
-        del package_roots  # normalization plus strict root checks are the provenance boundary
         _apply_required_patches(root, repo_root / "scripts/install/post_install.sh", temporary / "patch")
 
         try:
@@ -673,6 +763,7 @@ def repack(source: Path, output: Path, *, engine_stamp_json: Path | None = None,
         dart_version, snapshot_size = _compile_and_load(root, tool_args, temporary / "runtime")
         snapshot = cache / "flutter_tools.snapshot"
         snapshot_sha = sha256_file(snapshot)
+        payload_manifest = validate_package_payload_routes(pkg, root, package_roots)
 
         try:
             source_metadata = json.loads(source.with_name("build_metadata.json").read_text(encoding="utf-8"))
@@ -698,6 +789,7 @@ def repack(source: Path, output: Path, *, engine_stamp_json: Path | None = None,
             "tool_args": tool_args,
             "source_build_run_id": source_metadata.get("run_id"),
             "native_elf_inventory": old_native,
+            "required_payload_manifest": payload_manifest,
             "limitations": [
                 "Engine/native ELF payload is reused from the pinned CI archive; this is not a fresh GN build.",
                 "Android SDK binaries are not redistributed; package configuration requires a complete Termux SDK.",
