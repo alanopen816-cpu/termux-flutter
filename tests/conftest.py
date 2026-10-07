@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Union
+from typing import Iterable, Union
 import pytest
 
 # Ensure repository root and tests directory are in sys.path
@@ -29,10 +29,17 @@ def _installed_dartvm(environment=None) -> str | None:
 
 
 _DARTVM = _installed_dartvm()
+_SHELL = shutil.which("sh")
 
 
-def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, str]:
-    """Return a subprocess environment with all user state and SDK roots test-local."""
+def isolated_user_env(
+    state_root: Union[str, Path], base_env=None, fixture_path_entries: Iterable[Union[str, Path]] = ()
+) -> dict[str, str]:
+    """Return a private environment with SDK guards before inherited PATH.
+
+    Only caller-owned mock directories passed as ``fixture_path_entries`` may
+    precede the private Flutter and Dart guards.
+    """
     root = Path(state_root).resolve()
     home = root / "home"
     prefix = root / "prefix"
@@ -52,9 +59,9 @@ def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, 
         "ANDROID_USER_HOME": home / ".android",
         "ANDROID_SDK_HOME": home / ".android-sdk-home",
         "ANDROID_AVD_HOME": home / ".android/avd",
+        "TEST_USER_GUARD_BIN": root / "sdk-command-guards",
         "PREFIX": prefix,
         "FLUTTER_ROOT": flutter_root,
-        "DART_SDK": flutter_root / "bin" / "cache" / "dart-sdk",
         "ANDROID_HOME": android_home,
         "ANDROID_SDK_ROOT": android_home,
         "ANDROID_SDK": android_home,
@@ -70,6 +77,19 @@ def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, 
         path.mkdir(parents=True, exist_ok=True)
     paths["XDG_RUNTIME_DIR"].chmod(0o700)
     env = os.environ.copy() if base_env is None else dict(base_env)
+    shell = _SHELL or shutil.which("sh", path=env.get("PATH"))
+    if not shell:
+        raise RuntimeError("test isolation requires a native sh executable for SDK command guards")
+    guard_bin = paths["TEST_USER_GUARD_BIN"]
+    for name in ("flutter", "dart"):
+        guard = guard_bin / name
+        guard.write_text(
+            f"#!{Path(shell).resolve()}\n"
+            f"echo '{name} blocked by test SDK isolation' >&2\n"
+            "exit 125\n",
+            encoding="utf-8",
+        )
+        guard.chmod(0o755)
 
     # Keep native Termux utilities available, but never resolve Flutter from a
     # caller's installed SDK. Tests that need a fixture Flutter command install
@@ -81,16 +101,30 @@ def isolated_user_env(state_root: Union[str, Path], base_env=None) -> dict[str, 
     old_prefix = env.get("PREFIX")
     if old_prefix:
         old_roots.append((Path(old_prefix).expanduser() / "opt" / "flutter").resolve())
+    inherited_path = [entry for entry in env.get("PATH", "").split(os.pathsep) if entry]
+    explicit_fixture_path = []
     filtered_path = []
-    for entry in env.get("PATH", "").split(os.pathsep):
-        if not entry:
-            continue
+    old_prefix_bin = (Path(old_prefix).expanduser() / "bin").resolve() if old_prefix else None
+    for entry in fixture_path_entries:
+        candidate = Path(entry).expanduser().resolve()
+        if not candidate.is_dir():
+            raise ValueError(f"fixture PATH entry must be an existing directory: {candidate}")
+        if any(candidate == old_root or candidate.is_relative_to(old_root) for old_root in old_roots):
+            raise ValueError(f"fixture PATH entry must not point into a caller Flutter SDK: {candidate}")
+        if old_prefix_bin and (candidate == old_prefix_bin or candidate.is_relative_to(old_prefix_bin)):
+            raise ValueError(f"fixture PATH entry must not point into a caller Termux prefix: {candidate}")
+        explicit_fixture_path.append(str(candidate))
+    for entry in inherited_path:
         candidate = Path(entry).expanduser().resolve()
         if any(candidate == old_root or candidate.is_relative_to(old_root) for old_root in old_roots):
             continue
         filtered_path.append(entry)
     env.update({key: str(value) for key, value in paths.items()})
-    env["PATH"] = os.pathsep.join(filtered_path)
+    # Let each command derive DART_SDK from its selected FLUTTER_ROOT. A
+    # generic private DART_SDK here would override fixture roots exported by
+    # shell-based tests and could fall through to a caller's system Dart.
+    env.pop("DART_SDK", None)
+    env["PATH"] = os.pathsep.join(explicit_fixture_path + [str(guard_bin)] + filtered_path)
     if env.get("DARTVM"):
         env["DARTVM"] = str(Path(env["DARTVM"]).expanduser().resolve())
     elif _DARTVM:
@@ -118,10 +152,10 @@ def isolate_test_user_state(tmp_path_factory, monkeypatch):
         "TMP",
         "TEMP",
         "TEST_USER_STATE_ROOT",
+        "TEST_USER_GUARD_BIN",
         "PATH",
         "PREFIX",
         "FLUTTER_ROOT",
-        "DART_SDK",
         "ANDROID_HOME",
         "ANDROID_SDK_ROOT",
         "ANDROID_SDK",
@@ -133,6 +167,7 @@ def isolate_test_user_state(tmp_path_factory, monkeypatch):
     ):
         if key in env:
             monkeypatch.setenv(key, env[key])
+    monkeypatch.delenv("DART_SDK", raising=False)
 
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))

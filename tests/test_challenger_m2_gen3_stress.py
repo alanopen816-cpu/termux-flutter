@@ -618,9 +618,9 @@ exit 0
 
 
 @pytest.mark.parametrize("cli_mode,expected_override", [
-    (None, "/data/data/com.termux/files/usr/bin/aapt2"),
-    ("--mode=A", "/data/data/com.termux/files/usr/bin/aapt2"),
-    ("--mode=B", "/Android/Sdk/build-tools/35.0.0/aapt2"),
+    (None, "native"),
+    ("--mode=A", "native"),
+    ("--mode=B", "build-tools"),
     ("--aapt2=/custom/cli/aapt2", "/custom/cli/aapt2"),
 ])
 def test_adversarial_flutter_project_config_strict_pipefail_and_modes(tmp_path, cli_mode, expected_override):
@@ -628,6 +628,14 @@ def test_adversarial_flutter_project_config_strict_pipefail_and_modes(tmp_path, 
     Adversarially challenge flutter_project_config.sh under `bash -euo pipefail`
     with various mode arguments (--mode=A, --mode=B, --aapt2=..., default auto-detect).
     """
+    if expected_override == "native":
+        expected_override = str(Path(os.environ["PREFIX"]) / "bin" / "aapt2")
+    elif expected_override == "build-tools":
+        mode_b_aapt2 = Path(os.environ["HOME"]) / "Android" / "Sdk" / "build-tools" / "35.0.0" / "aapt2"
+        mode_b_aapt2.parent.mkdir(parents=True, exist_ok=True)
+        mode_b_aapt2.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        mode_b_aapt2.chmod(0o755)
+        expected_override = str(mode_b_aapt2)
     proj = tmp_path / f"adv_strict_{cli_mode.replace('=', '_').replace('-', '') if cli_mode else 'default'}"
     android_dir = proj / "android" / "app"
     android_dir.mkdir(parents=True)
@@ -728,7 +736,7 @@ def test_adversarial_gradle_properties_unusual_comments_and_formatting(tmp_path)
     # Verify only ONE active android.aapt2FromMavenOverride exists
     active_overrides = [l for l in lines if l.strip().startswith("android.aapt2FromMavenOverride")]
     assert len(active_overrides) == 1, f"Expected exactly 1 active override, found: {active_overrides}"
-    assert active_overrides[0] == "android.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2"
+    assert active_overrides[0] == f"android.aapt2FromMavenOverride={Path(os.environ['PREFIX']) / 'bin' / 'aapt2'}"
 
     # Verify 100 consecutive runs idempotency
     hash_props_1 = hashlib.sha256(gradle_props.read_bytes()).hexdigest()
@@ -778,7 +786,8 @@ def test_adversarial_gradle_properties_crlf_format_stability(tmp_path):
 
     transformed_props_text = gradle_props.read_text(encoding="utf-8")
     assert "android.useAndroidX=true" in transformed_props_text
-    assert "android.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2" in transformed_props_text
+    expected_aapt2 = Path(os.environ["PREFIX"]) / "bin" / "aapt2"
+    assert f"android.aapt2FromMavenOverride={expected_aapt2}" in transformed_props_text
 
     # Verify 50 runs hash stability
     hash_props_1 = hashlib.sha256(gradle_props.read_bytes()).hexdigest()
@@ -917,5 +926,4 @@ def test_adversarial_crash_simulation_autocreated_props_full_cleanup(tmp_path):
     assert build_gradle.read_bytes() == orig_gradle_bytes
     assert not (proj / ".termux_project_config.json").exists()
     assert not (android_dir / "build.gradle.bak").exists()
-
 

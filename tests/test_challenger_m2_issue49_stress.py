@@ -214,13 +214,18 @@ def test_adversarial_mode_a_b_and_env_precedence(tmp_path):
     cmd4 = f"unset AAPT2_OVERRIDE && unset TERMUX_AAPT2_PATH && bash '{cfg_sh}' --mode=A '{proj_sh}'"
     res4 = subprocess.run(["bash", "-c", cmd4], cwd=str(REPO_ROOT), capture_output=True, text=True)
     assert res4.returncode == 0, f"cmd4 failed: {res4.stderr}"
-    assert "android.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2" in gradle_props.read_text()
+    expected_native_aapt2 = Path(os.environ["PREFIX"]) / "bin" / "aapt2"
+    assert f"android.aapt2FromMavenOverride={expected_native_aapt2}" in gradle_props.read_text()
 
     # 5. --mode=B sets static build-tools aapt2
+    mode_b_aapt2 = Path(os.environ["HOME"]) / "Android" / "Sdk" / "build-tools" / "35.0.0" / "aapt2"
+    mode_b_aapt2.parent.mkdir(parents=True, exist_ok=True)
+    mode_b_aapt2.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    mode_b_aapt2.chmod(0o755)
     cmd5 = f"unset AAPT2_OVERRIDE && unset TERMUX_AAPT2_PATH && bash '{cfg_sh}' --mode=B '{proj_sh}'"
     res5 = subprocess.run(["bash", "-c", cmd5], cwd=str(REPO_ROOT), capture_output=True, text=True)
     assert res5.returncode == 0, f"cmd5 failed: {res5.stderr}"
-    assert "Android/Sdk/build-tools/35.0.0/aapt2" in gradle_props.read_text() or "android-sdk/build-tools/35.0.0/aapt2" in gradle_props.read_text()
+    assert str(mode_b_aapt2) in gradle_props.read_text()
 
 
 def test_adversarial_transactional_error_trap(tmp_path):

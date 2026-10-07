@@ -3,6 +3,7 @@
 import os
 import hashlib
 import shutil
+import subprocess
 from pathlib import Path
 import sys
 
@@ -66,7 +67,6 @@ def test_pytest_process_uses_test_local_user_directories(tmp_path_factory):
         "ANDROID_SDK_HOME",
         "PREFIX",
         "FLUTTER_ROOT",
-        "DART_SDK",
         "ANDROID_HOME",
         "ANDROID_SDK_ROOT",
         "ANDROID_SDK",
@@ -78,6 +78,8 @@ def test_pytest_process_uses_test_local_user_directories(tmp_path_factory):
         assert Path(os.environ[variable]).is_relative_to(test_root)
     assert Path(os.environ["TMPDIR"]).is_relative_to(test_root)
     assert Path(os.environ["TEST_USER_STATE_ROOT"]).is_relative_to(test_root)
+    assert Path(os.environ["TEST_USER_GUARD_BIN"]).is_relative_to(test_root)
+    assert "DART_SDK" not in os.environ, "fixture-specific FLUTTER_ROOT must determine DART_SDK"
     dartvm = os.environ.get("DARTVM")
     if dartvm:
         assert Path(dartvm).is_absolute()
@@ -156,7 +158,7 @@ def test_isolated_environment_redirects_sdk_roots_and_removes_live_flutter_path(
     assert isolated["ANDROID_NDK_ROOT"] == isolated["ANDROID_NDK_HOME"]
     assert isolated["ANDROID_NDK"] == isolated["ANDROID_NDK_HOME"]
     assert isolated["NDK_ROOT"] == isolated["ANDROID_NDK_HOME"]
-    assert isolated["DART_SDK"] != caller["DART_SDK"]
+    assert "DART_SDK" not in isolated, "caller DART_SDK must not override a fixture FLUTTER_ROOT"
     assert str(live_flutter / "bin") not in isolated["PATH"].split(os.pathsep)
     assert str(live_prefix / "bin") in isolated["PATH"].split(os.pathsep)
     after = {
@@ -193,3 +195,55 @@ def test_autouse_fixture_removes_synthetic_flutter_path_from_process(monkeypatch
     assert os.environ["PREFIX"] != str(caller_prefix)
     assert os.environ["FLUTTER_ROOT"] != str(caller_prefix / "opt" / "flutter")
     assert shutil.which("flutter") != str(fake_flutter)
+
+
+def test_autouse_fixture_guards_native_prefix_flutter_and_dart_wrappers(monkeypatch, tmp_path, tmp_path_factory):
+    caller_prefix = tmp_path / "caller-prefix"
+    caller_bin = caller_prefix / "bin"
+    caller_bin.mkdir(parents=True)
+    marker = tmp_path / "caller-wrapper-executed"
+    for name in ("flutter", "dart"):
+        wrapper = caller_bin / name
+        wrapper.write_text(f"#!/bin/sh\nprintf '%s\\n' {name} >> '{marker}'\nexit 0\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+
+    monkeypatch.setenv("PREFIX", str(caller_prefix))
+    monkeypatch.setenv("FLUTTER_ROOT", str(caller_prefix / "opt" / "flutter"))
+    monkeypatch.setenv("PATH", os.pathsep.join((str(caller_bin), os.environ.get("PATH", ""))))
+
+    isolate_test_user_state.__wrapped__(tmp_path_factory, monkeypatch)
+
+    guard_bin = Path(os.environ["TEST_USER_GUARD_BIN"])
+    assert shutil.which("flutter") == str(guard_bin / "flutter")
+    assert shutil.which("dart") == str(guard_bin / "dart")
+    for command in ("flutter", "dart"):
+        result = subprocess.run([command, "--version"], capture_output=True, text=True)
+        assert result.returncode != 0
+        assert "blocked by test SDK isolation" in result.stderr
+    assert not marker.exists(), "caller SDK wrappers must never execute during isolation"
+
+    unknown_bin = tmp_path / "caller-unknown-path"
+    unknown_bin.mkdir()
+    for name in ("flutter", "dart"):
+        wrapper = unknown_bin / name
+        wrapper.write_text(f"#!/bin/sh\nprintf '%s\\n' {name} >> '{marker}'\nexit 0\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join((str(unknown_bin), os.environ["PATH"])))
+    isolate_test_user_state.__wrapped__(tmp_path_factory, monkeypatch)
+    refreshed_guard_bin = Path(os.environ["TEST_USER_GUARD_BIN"])
+    assert shutil.which("flutter") == str(refreshed_guard_bin / "flutter")
+    assert shutil.which("dart") == str(refreshed_guard_bin / "dart")
+    assert not marker.exists(), "unknown inherited PATH entries must not precede fresh guards"
+
+    fixture_bin = tmp_path / "fixture-bin"
+    fixture_bin.mkdir()
+    for name in ("flutter", "dart"):
+        mock = fixture_bin / name
+        mock.write_text(f"#!/bin/sh\necho 'fixture {name}'\n", encoding="utf-8")
+        mock.chmod(0o755)
+    child_env = isolated_user_env(tmp_path / "fixture-child-state", fixture_path_entries=(fixture_bin,))
+    for name in ("flutter", "dart"):
+        assert shutil.which(name, path=child_env["PATH"]) == str(fixture_bin / name)
+        result = subprocess.run([name], env=child_env, capture_output=True, text=True)
+        assert result.returncode == 0
+        assert result.stdout.strip() == f"fixture {name}"

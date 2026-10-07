@@ -2,6 +2,7 @@ import hashlib
 import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 import pytest
 
@@ -146,7 +147,7 @@ class AndroidGenSnapshotArtifacts extends EngineCachedArtifact {
     return flutter_root, android_sdk, prefix, files
 
 
-def run_post_install(flutter_root, android_sdk, prefix, args=None):
+def run_post_install(flutter_root, android_sdk, prefix, args=None, fixture_path_entries=()):
     if args is None:
         args = ["--apply"]
     post_install_path = to_bash_path(POST_INSTALL)
@@ -161,7 +162,10 @@ def run_post_install(flutter_root, android_sdk, prefix, args=None):
         f"export DART_SDK='{flut_path}/bin/cache/dart-sdk' && "
         f"bash '{post_install_path}' {' '.join(args)}"
     )
-    env = isolated_user_env(prefix.parent / ".post-install-user-state")
+    env = isolated_user_env(
+        prefix.parent / ".post-install-user-state",
+        fixture_path_entries=fixture_path_entries,
+    )
     res = subprocess.run(["bash", "-c", cmd], env=env, cwd=str(REPO_ROOT), capture_output=True, text=True)
     return res
 
@@ -228,7 +232,30 @@ def test_missing_compiler_fails_closed(tmp_path):
     mock_dart = flutter_root / "bin" / "cache" / "dart-sdk" / "bin" / "dart"
     mock_dart.unlink()
 
-    res = run_post_install(flutter_root, android_sdk, prefix, ["--apply"])
+    # post_install checks `dart --version` before the finalizer verifies the
+    # fixture compiler path. Supply a deterministic private fallback so this
+    # test reaches the intended missing-compiler check rather than caller Dart.
+    with (REPO_ROOT / "build.toml").open("rb") as build_file:
+        canonical_dart_version = tomllib.load(build_file)["flutter"]["dart_version"]
+    fallback_dart = prefix / "bin" / "dart"
+    fallback_dart.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = \"--version\" ]; then\n"
+        f"  echo 'Dart SDK version: {canonical_dart_version}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "echo 'fixture fallback Dart cannot compile' >&2\n"
+        "exit 88\n",
+        encoding="utf-8",
+    )
+    fallback_dart.chmod(0o755)
+    res = run_post_install(
+        flutter_root,
+        android_sdk,
+        prefix,
+        ["--apply"],
+        fixture_path_entries=(prefix / "bin",),
+    )
     assert res.returncode != 0, "post_install must fail closed when compiler is missing"
     assert "Dart compiler missing" in res.stderr or "Dart compiler missing" in res.stdout
 

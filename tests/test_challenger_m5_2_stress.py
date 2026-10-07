@@ -139,7 +139,8 @@ android {
         assert "compileSdk = 34" in kts_content
         assert "targetSdk = 34" in kts_content
         assert 'abiFilters += listOf("arm64-v8a")' in kts_content
-        assert "android.aapt2FromMavenOverride=/data/data/com.termux/files/usr/bin/aapt2" in props_content
+        expected_aapt2 = Path(os.environ["PREFIX"]) / "bin" / "aapt2"
+        assert f"android.aapt2FromMavenOverride={expected_aapt2}" in props_content
 
         # Create mock Groovy Gradle project
         proj_groovy = tmp_dir / "mock_flutter_groovy"
